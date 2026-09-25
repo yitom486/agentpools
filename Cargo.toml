@@ -1,0 +1,12 @@
+[package]
+name = "agentpools"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded agent session pools and ordered task scheduling"
+readme = "README.md"
+
+[workspace]
+members = [".", "crates/agentpools-acp", "bindings/node", "bindings/python"]
+resolver = "3"
+
+[dependencies]

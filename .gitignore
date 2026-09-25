@@ -1,0 +1,13 @@
+/target
+**/node_modules
+**/*.node
+**/*.pyd
+**/*.so
+**/*.dylib
+**/__pycache__
+**/.venv
+**/dist
+**/wheels
+/bindings/node/index.d.ts
+/bindings/node/native.d.ts
+/bindings/node/native.js

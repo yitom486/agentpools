@@ -1,0 +1,32 @@
+[package]
+name = "agentpools-acp"
+version = "0.1.0"
+edition = "2024"
+description = "ACP stdio adapter for agentpools"
+readme = "README.md"
+
+[features]
+test-support = []
+mcp-example = ["dep:rmcp", "dep:tokio"]
+
+[dependencies]
+agentpools = { version = "0.1.0", path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmcp = { version = "3.3", default-features = false, features = ["server", "client", "macros", "schemars", "transport-io", "transport-child-process"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-std", "time"], optional = true }
+
+[[bin]]
+name = "agentpools-acp-mock-agent"
+path = "tests/bin/mock_agent.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "agentpools-mcp-add"
+path = "tests/bin/mcp_add.rs"
+required-features = ["mcp-example"]
+
+[[example]]
+name = "batch_add"
+path = "examples/batch_add.rs"
+required-features = ["mcp-example"]

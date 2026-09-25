@@ -1,0 +1,20 @@
+[package]
+name = "agentpools-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+include = ["Cargo.toml", "build.rs", "src/**"]
+
+[lib]
+name = "agentpools_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+agentpools = { path = "../.." }
+agentpools-acp = { path = "../../crates/agentpools-acp" }
+napi = { version = "3", features = ["napi8"] }
+napi-derive = "3"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2.5"

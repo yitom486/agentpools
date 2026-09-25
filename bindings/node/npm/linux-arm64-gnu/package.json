@@ -1,0 +1,21 @@
+{
+  "name": "agentpools-linux-arm64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "agentpools.linux-arm64-gnu.node",
+  "files": [
+    "agentpools.linux-arm64-gnu.node"
+  ],
+  "description": "Bounded ACP agent session pools for Node.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

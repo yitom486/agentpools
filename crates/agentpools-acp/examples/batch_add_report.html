@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent 池加法测试报告</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: light-dark(#f7f6fa, #252437);
+      --text: light-dark(#242132, #f5f2fb);
+      --muted: light-dark(#6e687a, #a49cb5);
+      --card: light-dark(#eeedf4, #302f43);
+      --track: light-dark(#e4e1ea, #373649);
+      --bar: light-dark(#9b8a9a, #716571);
+      --bar-text: #fff;
+      --success: light-dark(#167342, #62dc91);
+      --warning: light-dark(#9c681b, #e8b65f);
+      --danger: light-dark(#b13d49, #ff8b97);
+      --rule: light-dark(#dbd7e3, #424052);
+      font-family: system-ui, "Microsoft YaHei", sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--page); color: var(--text); }
+    main { width: min(100%, 1160px); margin: 0 auto; padding: 26px 28px 54px; }
+    h1 { margin: 0; font-size: clamp(22px, 3vw, 32px); font-weight: 500; letter-spacing: .02em; }
+    .subtitle { margin: 5px 0 28px; color: var(--muted); font-size: 15px; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 32px; }
+    .stat { background: var(--card); border-radius: 16px; padding: 17px 20px; }
+    .stat-label { display: block; color: var(--muted); font-size: 15px; }
+    .stat-value { display: block; margin-top: 7px; font-size: 28px; font-weight: 500; line-height: 1.2; }
+    .timeline { display: grid; gap: 18px; }
+    .lane { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 14px; align-items: center; }
+    .lane-name { display: block; font-size: 17px; font-weight: 500; }
+    .lane-count { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; }
+    .track { position: relative; height: 46px; background: var(--track); }
+    .bar { position: absolute; top: 5px; bottom: 5px; display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; background: var(--bar); color: var(--bar-text); font-size: 14px; }
+    .bar + .bar { box-shadow: inset 1px 0 var(--track); }
+    .bar.unverified { background: var(--warning); color: var(--page); }
+    .bar.failed { background: var(--danger); color: var(--page); }
+    .axis { display: flex; justify-content: space-between; margin: 17px 0 8px 134px; color: var(--muted); font-size: 13px; }
+    .legend { margin: 13px 0 30px 134px; display: flex; flex-wrap: wrap; gap: 10px 18px; color: var(--muted); font-size: 12px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 11px; height: 11px; background: var(--bar); }
+    .swatch.unverified { background: var(--warning); }
+    .swatch.failed { background: var(--danger); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 11px 8px; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+    th { font-size: 15px; font-weight: 500; }
+    td { font-size: 14px; }
+    td:first-child { font-weight: 500; }
+    td.numeric, th.numeric { text-align: right; white-space: nowrap; }
+    td.result { min-width: 155px; overflow-wrap: anywhere; }
+    .good { color: var(--success); }
+    .warn { color: var(--warning); }
+    .bad { color: var(--danger); }
+    .raw { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 640px) {
+      main { padding: 20px 14px 40px; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .stat { padding: 12px; border-radius: 12px; }
+      .stat-label { font-size: 12px; }
+      .stat-value { font-size: 20px; }
+      .lane { grid-template-columns: 68px minmax(0, 1fr); gap: 7px; }
+      .lane-name { font-size: 13px; }
+      .lane-count { font-size: 11px; }
+      .track { height: 36px; }
+      .bar { top: 4px; bottom: 4px; font-size: 11px; }
+      .axis, .legend { margin-left: 75px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="title">Agent 池加法测试</h1>
+    <p class="subtitle" id="subtitle"></p>
+    <section class="stats" id="stats" aria-label="测试汇总"></section>
+    <section class="timeline" id="timeline" aria-label="Agent 执行时间线"></section>
+    <div class="axis" id="axis" aria-hidden="true"></div>
+    <div class="legend" aria-label="时间线图例">
+      <span class="legend-item"><i class="swatch" aria-hidden="true"></i>正确且 MCP 已调用</span>
+      <span class="legend-item"><i class="swatch unverified" aria-hidden="true"></i>回复格式不符或 MCP 未验证</span>
+      <span class="legend-item"><i class="swatch failed" aria-hidden="true"></i>数值错误或任务失败</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>任务</th><th>计算</th><th>Agent / PID</th><th class="numeric">开始</th><th class="numeric">结束</th><th>结果</th></tr></thead>
+      <tbody id="task-rows"></tbody>
+    </table></div>
+  </main>
+  <script>
+    const report = __REPORT_JSON__;
+    const $ = id => document.getElementById(id);
+    const taskCount = report.tasks.length;
+    const laneCount = 4;
+    const ms = value => `${Math.round(Number(value))} ms`;
+    const mode = report.model ? `${report.mode} · ${report.model}` : report.mode;
+    $('title').textContent = `${laneCount} 个 Agent · ${taskCount} 道加法题`;
+    $('subtitle').textContent = `${mode} · ${report.agent_processes} 个实际进程及 MCP 调用记录`;
+    for (const [label, value] of [
+      ['数值正确', `${report.correct}/${taskCount}`],
+      ['纯整数格式', `${report.format_compliant}/${taskCount}`],
+      ['MCP 调用', `${report.mcp_verified}/${taskCount}`],
+      ['总耗时', ms(report.total_ms)]
+    ]) {
+      const card = document.createElement('div'); card.className = 'stat';
+      const caption = document.createElement('span'); caption.className = 'stat-label'; caption.textContent = label;
+      const number = document.createElement('strong'); number.className = 'stat-value'; number.textContent = value;
+      card.append(caption, number); $('stats').append(card);
+    }
+    const total = Math.max(1, Number(report.total_ms));
+    for (let agent = 0; agent < laneCount; agent++) {
+      const tasks = report.tasks.filter(task => task.agent === agent);
+      const lane = document.createElement('div'); lane.className = 'lane';
+      const label = document.createElement('div');
+      const name = document.createElement('span'); name.className = 'lane-name'; name.textContent = `Agent ${agent + 1}`;
+      const count = document.createElement('span'); count.className = 'lane-count'; count.textContent = `${tasks.length} 个任务`;
+      label.append(name, count);
+      const track = document.createElement('div'); track.className = 'track';
+      for (const task of tasks) {
+        const bar = document.createElement('div');
+        bar.className = `bar${task.correct ? (task.mcp_called && task.format_compliant ? '' : ' unverified') : ' failed'}`;
+        const start = Number(task.started_ms ?? task.submitted_ms);
+        const end = Number(task.finished_ms);
+        const left = Math.max(0, Math.min(100, start / total * 100));
+        bar.style.left = `${left}%`;
+        bar.style.width = `${Math.max(1, Math.min(100 - left, (end - start) / total * 100))}%`;
+        bar.textContent = `#${task.id}`;
+        bar.title = `任务 #${task.id} · ${task.a} + ${task.b} = ${task.expected}\n${ms(start)}–${ms(end)} · ${task.answer ?? task.error ?? '无结果'}`;
+        track.append(bar);
+      }
+      lane.append(label, track); $('timeline').append(lane);
+    }
+    for (const tick of [0, Math.round(total / 2), total]) {
+      const span = document.createElement('span'); span.textContent = ms(tick); $('axis').append(span);
+    }
+    for (const task of report.tasks) {
+      const tr = document.createElement('tr');
+      const result = !task.correct ? '数值错误或任务失败'
+        : !task.format_compliant && !task.mcp_called ? '数值正确 · 格式不符 · MCP 未验证'
+        : !task.format_compliant ? '数值正确 · 回复格式不符'
+        : !task.mcp_called ? '答案正确 · MCP 未验证' : '正确 · MCP 已调用';
+      const values = [
+        `#${String(task.id).padStart(2, '0')}`,
+        `${task.a} + ${task.b} = ${task.expected}`,
+        task.agent == null ? '未分配' : `Agent ${task.agent + 1} / ${task.process_id}`,
+        task.started_ms == null ? '—' : ms(task.started_ms),
+        ms(task.finished_ms),
+        result
+      ];
+      values.forEach((value, index) => {
+        const td = document.createElement('td'); td.textContent = value;
+        if (index === 3 || index === 4) td.classList.add('numeric');
+        if (index === 5) {
+          td.className = `result ${task.correct ? (task.mcp_called && task.format_compliant ? 'good' : 'warn') : 'bad'}`;
+          if (!task.correct || !task.mcp_called || !task.format_compliant) {
+            const detail = document.createElement('small'); detail.className = 'raw';
+            detail.textContent = task.error ?? task.answer ?? '没有回复'; td.append(detail);
+          }
+        }
+        tr.append(td);
+      });
+      $('task-rows').append(tr);
+    }
+  </script>
+</body>
+</html>
