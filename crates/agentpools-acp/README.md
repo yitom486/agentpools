@@ -57,6 +57,16 @@ cargo run -p agentpools-acp --example batch_add --all-features -- --codex
 
 真实模式要求每个会话选中 `gpt-6-luna`，并核对 16 次结果和对应的 MCP 调用记录；模型未被选中时立即报错。它会消耗真实模型额度。每次运行同样自动生成报告，写到新的 `target/agentpools-batch-add/codex-<时间戳>/` 目录。
 
+若要比较 4 个 ACP 进程与 1 个共享 ACP 进程，在完成 `cargo build -p agentpools-acp --example batch_add --all-features` 后，从**已经运行 `codex login` 的同一个 Windows 用户会话**执行：
+
+```powershell
+$env:CODEX_ACP_ENTRY = 'C:\absolute\path\to\node_modules\@agentclientprotocol\codex-acp\dist\index.js'
+.\examples\measure_batch_add.ps1 -Mode codex
+.\examples\measure_batch_add.ps1 -Mode codex-shared
+```
+
+采样脚本默认从当前用户的 Codex App 安装目录动态查找 `codex.exe`，升级后无需修改带版本编号的路径；需要指定其他 CLI 时可设置 `CODEX_PATH`。脚本先检查该 CLI 的 `codex login status`，再运行真实 ACP，并将耗时、进程数、工作集、私有内存及 CPU 采样写入 `target/agentpools-batch-add-resource/`。Codex 工具的受限执行环境可能使用另一 Windows 身份；即使它能读取同一 `auth.json`，也不代表它能复用用户登录态。认证失败时应在实际运行 Agent 的身份下检查 `whoami` 与 `codex login status`，不应复制登录令牌来规避身份差异。
+
 ## 当前兼容范围
 
 - 支持 ACP v1 stdio 的基础会话和文本回复；拒绝不兼容的协议版本。
