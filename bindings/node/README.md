@@ -43,6 +43,24 @@ main().catch(console.error)
 `{attempt}` are substituted and prepended to the next prompt. Retry happens
 only when the ACP adapter confirms the existing session can safely continue.
 
+For validation in application code after an answer, reserve a worker with a
+session lease. The queued work cannot use that worker until `finish()`:
+
+```js
+const lease = await pool.acquire()
+try {
+  let answer = await lease.ask('Create a draft')
+  while (needsCorrection(answer)) {
+    answer = await lease.ask(correctionFor(answer))
+  }
+} finally {
+  await lease.finish()
+}
+```
+
+`pool.acquire(agentIndex)` can reserve a specific worker. Release all leases
+before calling `pool.close()`, which waits for active workers.
+
 The workspace [language API contract](../../docs/language-api.md) describes
 configuration, task, cancellation, retry, and shutdown semantics. The npm
 package still needs its full platform build matrix and artifact collection

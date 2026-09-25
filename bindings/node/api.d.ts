@@ -49,8 +49,15 @@ export class Task {
   result(): Promise<AcpResponse>
 }
 
+export class SessionLease {
+  readonly agentIndex: number
+  ask(prompt: string | AcpPrompt): Promise<AcpResponse>
+  finish(): Promise<void>
+}
+
 export class AgentPool {
   constructor(options: AcpPoolOptions)
+  acquire(agentIndex?: number): Promise<SessionLease>
   submit(prompt: string | AcpPrompt, agentIndex?: number): Task
   submitRetrying(
     prompt: string | AcpPrompt,

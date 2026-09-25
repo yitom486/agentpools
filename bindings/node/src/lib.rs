@@ -1,7 +1,9 @@
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use agentpools::{AgentPool, CancellationToken, ShutdownMode, TaskHandle};
+use agentpools::{
+    AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode, TaskHandle,
+};
 use agentpools_acp::{AcpBackend, AcpError, AcpPoolOptions, AcpPrompt, AcpResponse};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -9,6 +11,8 @@ use serde_json::json;
 
 type Pool = AgentPool<AcpBackend>;
 type Handle = TaskHandle<AcpResponse, AcpError>;
+type AcpLeaseHandle = LeaseHandle<AcpBackend>;
+type AcpLease = SessionLease<AcpBackend>;
 
 #[napi]
 pub struct NativeAgentPool {
@@ -31,6 +35,21 @@ impl NativeAgentPool {
         }
         .map_err(|error| Error::from_reason(error.to_string()))?;
         Ok(NativeTask::new(handle))
+    }
+
+    #[napi]
+    pub fn request_lease(&self, agent_index: Option<u32>) -> Result<NativeSessionLease> {
+        let pool = self.pool.lock().unwrap_or_else(|error| error.into_inner());
+        let pool = pool
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("agent pool is closed"))?;
+        let handle = if let Some(index) = agent_index {
+            pool.request_lease_to(index as usize)
+        } else {
+            pool.request_lease()
+        }
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+        Ok(NativeSessionLease::new(handle))
     }
 
     #[napi]
@@ -168,6 +187,155 @@ impl NativeTask {
 
 pub struct WaitTask {
     handle: Option<Handle>,
+}
+
+#[napi]
+pub struct NativeSessionLease {
+    cancellation: CancellationToken,
+    request: Mutex<Option<AcpLeaseHandle>>,
+    lease: Arc<Mutex<Option<AcpLease>>>,
+}
+
+impl NativeSessionLease {
+    fn new(handle: AcpLeaseHandle) -> Self {
+        Self {
+            cancellation: handle.cancellation_token(),
+            request: Mutex::new(Some(handle)),
+            lease: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[napi]
+impl NativeSessionLease {
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    #[napi]
+    pub fn ready(&self) -> Result<AsyncTask<WaitLeaseTask>> {
+        let handle = self
+            .request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| Error::from_reason("lease request can only be awaited once"))?;
+        Ok(AsyncTask::new(WaitLeaseTask {
+            handle: Some(handle),
+            lease: Arc::clone(&self.lease),
+        }))
+    }
+
+    #[napi]
+    pub fn ask(&self, prompt_json: String) -> Result<AsyncTask<AskLeaseTask>> {
+        let prompt = parse_prompt(&prompt_json)?;
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| Error::from_reason("session lease is not ready, busy, or finished"))?;
+        Ok(AsyncTask::new(AskLeaseTask {
+            lease: Some(lease),
+            storage: Arc::clone(&self.lease),
+            prompt: Some(prompt),
+        }))
+    }
+
+    #[napi]
+    pub fn finish(&self) -> Result<AsyncTask<FinishLeaseTask>> {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| Error::from_reason("session lease is not ready, busy, or finished"))?;
+        Ok(AsyncTask::new(FinishLeaseTask { lease: Some(lease) }))
+    }
+}
+
+pub struct WaitLeaseTask {
+    handle: Option<AcpLeaseHandle>,
+    lease: Arc<Mutex<Option<AcpLease>>>,
+}
+
+impl Task for WaitLeaseTask {
+    type Output = u32;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(|| Error::from_reason("lease request was already consumed"))?;
+        let lease = handle
+            .wait()
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let agent_index = lease.agent_index() as u32;
+        *self.lease.lock().unwrap_or_else(|error| error.into_inner()) = Some(lease);
+        Ok(agent_index)
+    }
+
+    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct AskLeaseTask {
+    lease: Option<AcpLease>,
+    storage: Arc<Mutex<Option<AcpLease>>>,
+    prompt: Option<AcpPrompt>,
+}
+
+impl Task for AskLeaseTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let mut lease = self
+            .lease
+            .take()
+            .ok_or_else(|| Error::from_reason("session lease was already consumed"))?;
+        let prompt = self
+            .prompt
+            .take()
+            .ok_or_else(|| Error::from_reason("prompt was already consumed"))?;
+        let result = lease.ask(prompt);
+        *self
+            .storage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(lease);
+        let response = result.map_err(|error| Error::from_reason(error.to_string()))?;
+        serde_json::to_string(&response)
+            .map_err(|error| Error::from_reason(format!("cannot encode task response: {error}")))
+    }
+
+    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct FinishLeaseTask {
+    lease: Option<AcpLease>,
+}
+
+impl Task for FinishLeaseTask {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.lease
+            .take()
+            .ok_or_else(|| Error::from_reason("session lease was already consumed"))?
+            .finish()
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 impl Task for WaitTask {

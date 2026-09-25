@@ -7,6 +7,7 @@ import json
 from typing import Any, Mapping, Optional, Union
 
 from ._native import NativeAgentPool as _NativeAgentPool
+from ._native import NativeSessionLease as _NativeSessionLease
 from ._native import NativeTask as _NativeTask
 
 
@@ -38,6 +39,33 @@ class Task:
         return json.loads(encoded)
 
 
+class SessionLease:
+    """Exclusive agent session until ``finish`` or context exit."""
+
+    def __init__(self, native: _NativeSessionLease) -> None:
+        self._native: Optional[_NativeSessionLease] = native
+        self.agent_index = native.agent_index
+
+    async def ask(self, prompt: Union[str, Mapping[str, Any]]) -> dict[str, Any]:
+        native = self._native
+        if native is None:
+            raise RuntimeError("session lease is finished")
+        encoded = await asyncio.to_thread(native.ask, _encode_prompt(prompt))
+        return json.loads(encoded)
+
+    async def finish(self) -> None:
+        native = self._native
+        if native is not None:
+            self._native = None
+            await asyncio.to_thread(native.finish)
+
+    async def __aenter__(self) -> "SessionLease":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.finish()
+
+
 class AgentPool:
     """Bounded ACP worker pool with persistent, exclusive agent sessions."""
 
@@ -53,6 +81,15 @@ class AgentPool:
         agent_index: Optional[int] = None,
     ) -> Task:
         return Task(self._native.submit(_encode_prompt(prompt), agent_index))
+
+    async def acquire(self, agent_index: Optional[int] = None) -> SessionLease:
+        pending = self._native.request_lease(agent_index)
+        try:
+            native = await asyncio.to_thread(pending.wait)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+        return SessionLease(native)
 
     def submit_retrying(
         self,
@@ -86,4 +123,4 @@ class AgentPool:
         await self.close(drain=exc_type is None)
 
 
-__all__ = ["AgentPool", "Task"]
+__all__ = ["AgentPool", "SessionLease", "Task"]

@@ -16,6 +16,8 @@
 
 每个 worker 同时只执行一个任务。`submit_retrying` 把一次提交及其后续重试视为**同一个任务**：失败后先询问适配器当前会话是否可继续，再由调用方生成反馈请求；在最终成功、放弃或取消前，worker 不接收下一个任务。其他空闲 worker 仍可并行处理队列。普通 `submit` 是单次任务；它失败后会关闭状态不确定的会话。池不会擅自重试可能已有副作用的操作。
 
+如果成功响应仍需在调用方业务代码中校验，应使用 `acquire()` 获取独占 `SessionLease`。普通 `submit()` 的结果一返回，worker 就能接下一个任务，因此不能保护结果返回后的校验阶段。租借期间即使调用方暂时没有发送 prompt，该 worker 也不会处理队列里的其他任务；其他 worker 仍能并行工作。
+
 ## 使用
 
 ```toml
@@ -41,6 +43,19 @@ let report = pool.shutdown(ShutdownMode::Drain);
 `with_agents` 可以为各个 worker 指定不同的 Agent profile / 配置。`submit(request)` 交给任意空闲槽位；`submit_to(index, request)` 指定必须使用某个槽位及其工具配置。不同 Rust 类型的协议适配器可由调用方封装成统一的枚举适配器，共用请求、响应和错误类型。
 
 `submit_retrying(request, max_attempts, next_request)` / `submit_retrying_to(index, ...)` 适用于需要把错误反馈给同一 Agent 的任务。`next_request` 会收到错误和失败次数，返回下一条请求或 `None` 放弃。适配器的 `AgentSession::can_retry_after` 只有确认会话仍可继续时才应返回 `true`；默认是 `false`。传输断开或协议状态不明时，该任务终止，池会关闭会话。
+
+需要外部校验时，使用 `acquire()` / `acquire_to(index)`；异步调度方可先用 `request_lease()` / `request_lease_to(index)` 取得等待句柄，随后调用 `wait()`：
+
+```rust,ignore
+let mut lease = pool.acquire()?;
+let mut response = lease.ask(initial_request)?;
+while let Some(feedback) = validate_in_business_code(&response) {
+    response = lease.ask(make_correction_request(feedback))?;
+}
+lease.finish()?; // 归还 worker；直接 drop(lease) 也会归还
+```
+
+`SessionLease` 不知道业务校验规则，只负责独占会话。适配器报告可恢复的调用错误时，下次 `ask()` 继续使用原会话；状态不确定的错误会关闭原会话，后续 `ask()` 在**同一 worker** 上打开新会话。调用 `shutdown()` 前应先归还所有租借，否则关闭会等待被占用的 worker。
 
 ## 取消与关闭
 

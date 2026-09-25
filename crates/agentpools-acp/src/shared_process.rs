@@ -98,12 +98,12 @@ impl SharedManager {
         let signature = ProcessSignature::from_config(config);
         let (process, supports_close) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(existing) = &state.signature {
-                if existing != &signature {
-                    return Err(AcpError::InvalidConfig(
-                        "shared ACP sessions must use the same process, auth, and client capability settings",
-                    ));
-                }
+            if let Some(existing) = &state.signature
+                && existing != &signature
+            {
+                return Err(AcpError::InvalidConfig(
+                    "shared ACP sessions must use the same process, auth, and client capability settings",
+                ));
             }
 
             if let Some(process) = &state.process {

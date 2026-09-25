@@ -109,3 +109,48 @@ test(
     }
   },
 )
+
+test(
+  'external validation keeps a session leased until the caller finishes',
+  { skip: !fs.existsSync(mockAgent) },
+  async () => {
+    const testCase = fixture()
+    const pool = new AgentPool(testCase.options)
+    let lease
+    try {
+      lease = await pool.acquire()
+      assert.equal(lease.agentIndex, 0)
+      assert.deepEqual(await lease.ask('draft'), {
+        text: 'mock:draft',
+        stopReason: 'end_turn',
+      })
+      const queued = pool.submit('next task')
+      // The caller validates the draft here, outside any agent call.
+      assert.deepEqual(pool.status(), { queued: 1, active: 1, closed: false })
+      assert.deepEqual(await lease.ask('correction'), {
+        text: 'mock:correction',
+        stopReason: 'end_turn',
+      })
+      assert.equal(pool.status().queued, 1)
+      await lease.finish()
+      lease = null
+      assert.deepEqual(await queued.result(), {
+        text: 'mock:next task',
+        stopReason: 'end_turn',
+      })
+      await pool.close({ drain: true })
+
+      const messages = fs.readFileSync(testCase.logPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse)
+      assert.equal(messages.filter((message) => message.method === 'session/new').length, 1)
+      assert.deepEqual(
+        messages.filter((message) => message.method === 'session/prompt')
+          .map((message) => message.params.prompt[0].text),
+        ['draft', 'correction', 'next task'],
+      )
+    } finally {
+      if (lease) await lease.finish()
+      await pool.close({ drain: false })
+      fs.rmSync(testCase.directory, { recursive: true, force: true })
+    }
+  },
+)

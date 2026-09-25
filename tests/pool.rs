@@ -333,6 +333,72 @@ fn retry_keeps_same_session_and_worker_while_other_worker_progresses() {
 }
 
 #[test]
+fn external_validation_keeps_session_exclusive_while_other_worker_progresses() {
+    let state = Arc::new(State::default());
+    let mut pool = pool(&state, 2, 4);
+    let mut lease = pool.acquire_to(0).unwrap();
+    assert_eq!(lease.agent_index(), 0);
+
+    let first = lease.ask(Request::simple(7)).unwrap();
+    let queued_on_lease = pool.submit_to(0, Request::simple(8)).unwrap();
+    let parallel = pool.submit_to(1, Request::simple(9)).unwrap();
+    let parallel_result = parallel.wait().unwrap();
+    assert_eq!(parallel_result.0, 9);
+
+    // The caller is validating `first` here. No pool callback or active
+    // agent call is running, but the first worker must remain unavailable.
+    assert_eq!(pool.status().active, 1);
+    assert_eq!(pool.status().queued, 1);
+    let corrected = lease.ask(Request::simple(10)).unwrap();
+    assert_eq!(corrected.1, first.1);
+    assert_eq!(pool.status().queued, 1);
+
+    lease.finish().unwrap();
+    let queued_result = queued_on_lease.wait().unwrap();
+    assert_eq!(queued_result, (8, first.1));
+    assert_ne!(queued_result.1, parallel_result.1);
+    pool.shutdown(ShutdownMode::Drain);
+}
+
+#[test]
+fn dropping_a_lease_releases_its_worker() {
+    let state = Arc::new(State::default());
+    let mut pool = pool(&state, 1, 2);
+    let mut lease = pool.acquire().unwrap();
+    let session_id = lease.ask(Request::simple(1)).unwrap().1;
+    let queued = pool.submit(Request::simple(2)).unwrap();
+    assert_eq!(pool.status().queued, 1);
+    drop(lease);
+    assert_eq!(queued.wait().unwrap(), (2, session_id));
+    pool.shutdown(ShutdownMode::Drain);
+}
+
+#[test]
+fn leased_recoverable_error_allows_business_feedback_on_same_session() {
+    let state = Arc::new(State::default());
+    let mut pool = pool(&state, 1, 2);
+    let mut lease = pool.acquire().unwrap();
+    let session_id = lease.ask(Request::simple(1)).unwrap().1;
+    let queued = pool.submit(Request::simple(3)).unwrap();
+
+    let mut failing = Request::simple(2);
+    failing.retryable_fail = true;
+    assert!(matches!(
+        lease.ask(failing),
+        Err(TaskError::Run {
+            source: "retryable",
+            close: None
+        })
+    ));
+    assert_eq!(pool.status().queued, 1);
+    assert_eq!(lease.ask(Request::simple(2)).unwrap(), (2, session_id));
+    lease.finish().unwrap();
+    assert_eq!(queued.wait().unwrap(), (3, session_id));
+    pool.shutdown(ShutdownMode::Drain);
+    assert_eq!(state.opens.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn cancel_pending_shutdown_finishes_active_work_and_rejects_queue() {
     let state = Arc::new(State::default());
     let mut pool = pool(&state, 1, 2);

@@ -97,5 +97,43 @@ class BindingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await pool.close(drain=False)
             shutil.rmtree(directory, ignore_errors=True)
 
+    async def test_external_validation_keeps_session_leased(self):
+        directory, log_path, options = fixture()
+        pool = AgentPool(options)
+        lease = None
+        try:
+            lease = await pool.acquire()
+            self.assertEqual(lease.agent_index, 0)
+            self.assertEqual(await lease.ask("draft"), {"text": "mock:draft", "stopReason": "end_turn"})
+            queued = pool.submit("next task")
+            # The caller validates the draft here, outside any agent call.
+            self.assertEqual(pool.status(), {"queued": 1, "active": 1, "closed": False})
+            self.assertEqual(
+                await lease.ask("correction"),
+                {"text": "mock:correction", "stopReason": "end_turn"},
+            )
+            self.assertEqual(pool.status()["queued"], 1)
+            await lease.finish()
+            lease = None
+            self.assertEqual(
+                await queued.result(),
+                {"text": "mock:next task", "stopReason": "end_turn"},
+            )
+            await pool.close(drain=True)
+
+            messages = [json.loads(line) for line in log_path.read_text().splitlines()]
+            self.assertEqual(sum(m.get("method") == "session/new" for m in messages), 1)
+            prompts = [
+                m["params"]["prompt"][0]["text"]
+                for m in messages
+                if m.get("method") == "session/prompt"
+            ]
+            self.assertEqual(prompts, ["draft", "correction", "next task"])
+        finally:
+            if lease is not None:
+                await lease.finish()
+            await pool.close(drain=False)
+            shutil.rmtree(directory, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()

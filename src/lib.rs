@@ -11,6 +11,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// The protocol-specific session owned by one worker at a time.
 ///
@@ -119,8 +120,9 @@ pub type SubmitResult<B> = Result<
     SubmitError<<B as AgentBackend>::Request>,
 >;
 
-/// A task failure. Failed `run` calls close their session; they are not
-/// automatically retried because the request may have produced side effects.
+/// A task failure. Ordinary submitted tasks close their session after a failed
+/// `run`; a leased session remains usable only if its adapter confirms that
+/// the failed call left the protocol synchronized.
 #[derive(Debug)]
 pub enum TaskError<Error> {
     Open(Error),
@@ -175,6 +177,160 @@ impl<Response, Error> TaskHandle<Response, Error> {
     }
 }
 
+/// Failure to reserve an exclusive worker session.
+#[derive(Debug)]
+pub enum AcquireError<Error> {
+    Closed,
+    QueueFull,
+    NoSuchAgent,
+    Open(Error),
+    Cancelled,
+    WorkerStopped,
+}
+
+impl<Error: fmt::Display> fmt::Display for AcquireError<Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => write!(f, "agent pool is closed"),
+            Self::QueueFull => write!(f, "agent pool queue is full"),
+            Self::NoSuchAgent => write!(f, "agent index does not exist"),
+            Self::Open(error) => write!(f, "cannot open agent session: {error}"),
+            Self::Cancelled => write!(f, "session acquisition was cancelled"),
+            Self::WorkerStopped => write!(f, "agent worker stopped"),
+        }
+    }
+}
+
+impl<Error: std::error::Error + 'static> std::error::Error for AcquireError<Error> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// A queued request to reserve one worker. `wait` returns its exclusive lease.
+/// Dropping this handle before `wait` cancels the pending reservation.
+pub struct LeaseHandle<B: AgentBackend> {
+    cancellation: Option<CancellationToken>,
+    result: mpsc::Receiver<Result<LeaseReady<B>, AcquireError<B::Error>>>,
+}
+
+impl<B: AgentBackend> LeaseHandle<B> {
+    pub fn cancel(&self) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation
+            .as_ref()
+            .expect("lease handle has not been consumed")
+            .clone()
+    }
+
+    pub fn wait(mut self) -> Result<SessionLease<B>, AcquireError<B::Error>> {
+        loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(AcquireError::Cancelled);
+            }
+            match self.result.recv_timeout(Duration::from_millis(25)) {
+                Ok(result) => {
+                    if self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(AcquireError::Cancelled);
+                    }
+                    self.cancellation.take();
+                    return result.map(|ready| SessionLease {
+                        agent_index: ready.agent_index,
+                        commands: Some(ready.commands),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(AcquireError::WorkerStopped);
+                }
+            }
+        }
+    }
+}
+
+impl<B: AgentBackend> Drop for LeaseHandle<B> {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+}
+
+/// Exclusive access to one worker and its session across any number of calls.
+/// The worker cannot take another task until this lease is finished or dropped.
+pub struct SessionLease<B: AgentBackend> {
+    agent_index: usize,
+    commands: Option<mpsc::Sender<LeaseCommand<B>>>,
+}
+
+impl<B: AgentBackend> SessionLease<B> {
+    pub fn agent_index(&self) -> usize {
+        self.agent_index
+    }
+
+    /// Run one request on the reserved session. The caller can validate the
+    /// response outside the pool and call `ask` again before releasing it.
+    pub fn ask(&mut self, request: B::Request) -> Result<B::Response, TaskError<B::Error>> {
+        self.ask_with_cancellation(request, CancellationToken::default())
+    }
+
+    /// Like `ask`, with a token that another thread may cancel while the
+    /// adapter is running. A non-recoverable adapter failure closes the session;
+    /// a later call on this lease opens a new session on the same worker.
+    pub fn ask_with_cancellation(
+        &mut self,
+        request: B::Request,
+        cancellation: CancellationToken,
+    ) -> Result<B::Response, TaskError<B::Error>> {
+        let (sender, result) = mpsc::channel();
+        let commands = self.commands.as_ref().ok_or(TaskError::WorkerStopped)?;
+        commands
+            .send(LeaseCommand::Ask {
+                request,
+                cancellation,
+                result: sender,
+            })
+            .map_err(|_| TaskError::WorkerStopped)?;
+        result.recv().unwrap_or(Err(TaskError::WorkerStopped))
+    }
+
+    /// Release the worker and wait until it becomes available to the queue.
+    pub fn finish(mut self) -> Result<(), AcquireError<B::Error>> {
+        let commands = self.commands.take().ok_or(AcquireError::WorkerStopped)?;
+        let (sender, completed) = mpsc::channel();
+        commands
+            .send(LeaseCommand::Release {
+                completed: Some(sender),
+            })
+            .map_err(|_| AcquireError::WorkerStopped)?;
+        completed.recv().map_err(|_| AcquireError::WorkerStopped)
+    }
+}
+
+impl<B: AgentBackend> Drop for SessionLease<B> {
+    fn drop(&mut self) {
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(LeaseCommand::Release { completed: None });
+        }
+    }
+}
+
 /// Wait for every task and return one result per input handle, in input order.
 pub fn collect_ordered<Response, Error>(
     handles: impl IntoIterator<Item = TaskHandle<Response, Error>>,
@@ -212,6 +368,42 @@ struct Job<B: AgentBackend> {
     result: mpsc::Sender<Result<B::Response, TaskError<B::Error>>>,
 }
 
+struct LeaseRequest<B: AgentBackend> {
+    target: Option<usize>,
+    cancellation: CancellationToken,
+    result: mpsc::Sender<Result<LeaseReady<B>, AcquireError<B::Error>>>,
+}
+
+struct LeaseReady<B: AgentBackend> {
+    agent_index: usize,
+    commands: mpsc::Sender<LeaseCommand<B>>,
+}
+
+enum LeaseCommand<B: AgentBackend> {
+    Ask {
+        request: B::Request,
+        cancellation: CancellationToken,
+        result: mpsc::Sender<Result<B::Response, TaskError<B::Error>>>,
+    },
+    Release {
+        completed: Option<mpsc::Sender<()>>,
+    },
+}
+
+enum Work<B: AgentBackend> {
+    Task(Job<B>),
+    Lease(LeaseRequest<B>),
+}
+
+impl<B: AgentBackend> Work<B> {
+    fn target(&self) -> Option<usize> {
+        match self {
+            Self::Task(job) => job.target,
+            Self::Lease(request) => request.target,
+        }
+    }
+}
+
 struct RetryPlan<B: AgentBackend> {
     max_attempts: std::num::NonZeroUsize,
     next_request: Box<NextRequest<B>>,
@@ -221,7 +413,7 @@ type NextRequest<B> =
     dyn FnMut(&<B as AgentBackend>::Error, usize) -> Option<<B as AgentBackend>::Request> + Send;
 
 struct Queue<B: AgentBackend> {
-    jobs: VecDeque<Job<B>>,
+    jobs: VecDeque<Work<B>>,
     closed: bool,
 }
 
@@ -327,6 +519,63 @@ impl<B: AgentBackend> AgentPool<B> {
         self.submit_routed(Some(agent_index), request, None)
     }
 
+    /// Block until an idle worker has opened its session and reserve it until
+    /// the returned lease is finished or dropped. Business validation between
+    /// `ask` calls is part of the reservation.
+    pub fn acquire(&self) -> Result<SessionLease<B>, AcquireError<B::Error>> {
+        self.request_lease()?.wait()
+    }
+
+    /// Reserve a specific zero-based worker for a multi-round interaction.
+    pub fn acquire_to(
+        &self,
+        agent_index: usize,
+    ) -> Result<SessionLease<B>, AcquireError<B::Error>> {
+        self.request_lease_to(agent_index)?.wait()
+    }
+
+    /// Queue an exclusive reservation without blocking the caller. This is
+    /// useful for async runtimes and language bindings that wait elsewhere.
+    pub fn request_lease(&self) -> Result<LeaseHandle<B>, AcquireError<B::Error>> {
+        self.request_lease_routed(None)
+    }
+
+    /// Like `request_lease`, but reserve a chosen worker.
+    pub fn request_lease_to(
+        &self,
+        agent_index: usize,
+    ) -> Result<LeaseHandle<B>, AcquireError<B::Error>> {
+        self.request_lease_routed(Some(agent_index))
+    }
+
+    fn request_lease_routed(
+        &self,
+        target: Option<usize>,
+    ) -> Result<LeaseHandle<B>, AcquireError<B::Error>> {
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.closed {
+            return Err(AcquireError::Closed);
+        }
+        if target.is_some_and(|index| index >= self.shared.agent_count) {
+            return Err(AcquireError::NoSuchAgent);
+        }
+        if queue.jobs.len() >= self.shared.max_queued {
+            return Err(AcquireError::QueueFull);
+        }
+        let cancellation = CancellationToken::default();
+        let (sender, result) = mpsc::channel();
+        queue.jobs.push_back(Work::Lease(LeaseRequest {
+            target,
+            cancellation: cancellation.clone(),
+            result: sender,
+        }));
+        self.shared.ready.notify_all();
+        Ok(LeaseHandle {
+            cancellation: Some(cancellation),
+            result,
+        })
+    }
+
     /// Keep one worker and its session for the whole task, including recoverable
     /// failures and caller-directed retries. `next_request` receives the error
     /// and the failed attempt number, so it can send feedback to the same Agent.
@@ -385,13 +634,13 @@ impl<B: AgentBackend> AgentPool<B> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::default();
         let (sender, result) = mpsc::channel();
-        queue.jobs.push_back(Job {
+        queue.jobs.push_back(Work::Task(Job {
             request,
             retry,
             target,
             cancellation: cancellation.clone(),
             result: sender,
-        });
+        }));
         // Targeted tasks must wake their chosen worker, not an idle sibling.
         self.shared.ready.notify_all();
         Ok(TaskHandle {
@@ -411,15 +660,24 @@ impl<B: AgentBackend> AgentPool<B> {
     }
 
     /// Stop accepting tasks, then join workers and close their sessions.
+    /// Active leases must be finished or dropped before this call can return.
     /// Running calls must finish cooperatively or reach their adapter timeout.
     pub fn shutdown(&mut self, mode: ShutdownMode) -> ShutdownReport<B::Error> {
         {
             let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.closed = true;
             if mode == ShutdownMode::CancelPending {
-                for job in queue.jobs.drain(..) {
-                    job.cancellation.cancel();
-                    let _ = job.result.send(Err(TaskError::Cancelled));
+                for work in queue.jobs.drain(..) {
+                    match work {
+                        Work::Task(job) => {
+                            job.cancellation.cancel();
+                            let _ = job.result.send(Err(TaskError::Cancelled));
+                        }
+                        Work::Lease(request) => {
+                            request.cancellation.cancel();
+                            let _ = request.result.send(Err(AcquireError::Cancelled));
+                        }
+                    }
                 }
             }
             self.shared.ready.notify_all();
@@ -452,16 +710,16 @@ fn worker<B: AgentBackend>(
 ) -> Option<B::Error> {
     let mut session: Option<B::Session> = None;
     loop {
-        let job = {
+        let work = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 let eligible = queue
                     .jobs
                     .iter()
-                    .position(|job| job.target.is_none_or(|target| target == index));
-                if let Some(job) = eligible.and_then(|position| queue.jobs.remove(position)) {
+                    .position(|work| work.target().is_none_or(|target| target == index));
+                if let Some(work) = eligible.and_then(|position| queue.jobs.remove(position)) {
                     shared.active.fetch_add(1, Ordering::AcqRel);
-                    break Some(job);
+                    break Some(work);
                 }
                 if queue.closed {
                     break None;
@@ -469,58 +727,156 @@ fn worker<B: AgentBackend>(
                 queue = shared.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let Some(mut job) = job else { break };
-        if job.cancellation.is_cancelled() {
-            let _ = job.result.send(Err(TaskError::Cancelled));
-            shared.active.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-        if session.is_none() {
-            match agent.backend.open(&agent.session_config) {
-                Ok(opened) => session = Some(opened),
-                Err(error) => {
-                    let _ = job.result.send(Err(TaskError::Open(error)));
-                    shared.active.fetch_sub(1, Ordering::AcqRel);
-                    continue;
-                }
+        let Some(work) = work else { break };
+        let release_ack = match work {
+            Work::Task(job) => {
+                run_task(&agent, &mut session, job);
+                None
             }
-        }
-        let mut request = Some(job.request);
-        let mut attempt = 1;
-        let outcome = loop {
-            if job.cancellation.is_cancelled() {
-                break Err(TaskError::Cancelled);
-            }
-            let result = session.as_mut().expect("session just opened").run(
-                request.take().expect("request for attempt"),
-                &job.cancellation,
-            );
-            match result {
-                Ok(_response) if job.cancellation.is_cancelled() => {
-                    break Err(TaskError::Cancelled);
-                }
-                Ok(response) => break Ok(response),
-                Err(source) => {
-                    if !job.cancellation.is_cancelled()
-                        && let Some(retry) = job.retry.as_mut()
-                        && attempt < retry.max_attempts.get()
-                        && session
-                            .as_ref()
-                            .expect("session just ran")
-                            .can_retry_after(&source)
-                        && let Some(next) = (retry.next_request)(&source, attempt)
-                    {
-                        request = Some(next);
-                        attempt += 1;
-                        continue;
-                    }
-                    let close = session.take().and_then(|mut session| session.close().err());
-                    break Err(TaskError::Run { source, close });
-                }
-            }
+            Work::Lease(request) => run_lease(&agent, &mut session, index, request),
         };
-        let _ = job.result.send(outcome);
         shared.active.fetch_sub(1, Ordering::AcqRel);
+        if let Some(ack) = release_ack {
+            let _ = ack.send(());
+        }
     }
     session.and_then(|mut session| session.close().err())
+}
+
+fn run_task<B: AgentBackend>(
+    agent: &WorkerAgent<B>,
+    session: &mut Option<B::Session>,
+    mut job: Job<B>,
+) {
+    if job.cancellation.is_cancelled() {
+        let _ = job.result.send(Err(TaskError::Cancelled));
+        return;
+    }
+    if session.is_none() {
+        match agent.backend.open(&agent.session_config) {
+            Ok(opened) => *session = Some(opened),
+            Err(error) => {
+                let _ = job.result.send(Err(TaskError::Open(error)));
+                return;
+            }
+        }
+    }
+    let mut request = Some(job.request);
+    let mut attempt = 1;
+    let outcome = loop {
+        if job.cancellation.is_cancelled() {
+            break Err(TaskError::Cancelled);
+        }
+        let result = session.as_mut().expect("session just opened").run(
+            request.take().expect("request for attempt"),
+            &job.cancellation,
+        );
+        match result {
+            Ok(_response) if job.cancellation.is_cancelled() => {
+                break Err(TaskError::Cancelled);
+            }
+            Ok(response) => break Ok(response),
+            Err(source) => {
+                if !job.cancellation.is_cancelled()
+                    && let Some(retry) = job.retry.as_mut()
+                    && attempt < retry.max_attempts.get()
+                    && session
+                        .as_ref()
+                        .expect("session just ran")
+                        .can_retry_after(&source)
+                    && let Some(next) = (retry.next_request)(&source, attempt)
+                {
+                    request = Some(next);
+                    attempt += 1;
+                    continue;
+                }
+                let close = session.take().and_then(|mut session| session.close().err());
+                break Err(TaskError::Run { source, close });
+            }
+        }
+    };
+    let _ = job.result.send(outcome);
+}
+
+fn run_lease<B: AgentBackend>(
+    agent: &WorkerAgent<B>,
+    session: &mut Option<B::Session>,
+    index: usize,
+    request: LeaseRequest<B>,
+) -> Option<mpsc::Sender<()>> {
+    if request.cancellation.is_cancelled() {
+        let _ = request.result.send(Err(AcquireError::Cancelled));
+        return None;
+    }
+    if session.is_none() {
+        match agent.backend.open(&agent.session_config) {
+            Ok(opened) => *session = Some(opened),
+            Err(error) => {
+                let _ = request.result.send(Err(AcquireError::Open(error)));
+                return None;
+            }
+        }
+    }
+    if request.cancellation.is_cancelled() {
+        let _ = request.result.send(Err(AcquireError::Cancelled));
+        return None;
+    }
+    let (commands, receiver) = mpsc::channel();
+    if request
+        .result
+        .send(Ok(LeaseReady {
+            agent_index: index,
+            commands,
+        }))
+        .is_err()
+    {
+        return None;
+    }
+    loop {
+        match receiver.recv() {
+            Ok(LeaseCommand::Ask {
+                request,
+                cancellation,
+                result,
+            }) => {
+                if cancellation.is_cancelled() {
+                    let _ = result.send(Err(TaskError::Cancelled));
+                    continue;
+                }
+                if session.is_none() {
+                    match agent.backend.open(&agent.session_config) {
+                        Ok(opened) => *session = Some(opened),
+                        Err(error) => {
+                            let _ = result.send(Err(TaskError::Open(error)));
+                            continue;
+                        }
+                    }
+                }
+                let outcome = match session
+                    .as_mut()
+                    .expect("session just opened")
+                    .run(request, &cancellation)
+                {
+                    Ok(_response) if cancellation.is_cancelled() => Err(TaskError::Cancelled),
+                    Ok(response) => Ok(response),
+                    Err(source) => {
+                        let close = if !cancellation.is_cancelled()
+                            && session
+                                .as_ref()
+                                .expect("session just ran")
+                                .can_retry_after(&source)
+                        {
+                            None
+                        } else {
+                            session.take().and_then(|mut session| session.close().err())
+                        };
+                        Err(TaskError::Run { source, close })
+                    }
+                };
+                let _ = result.send(outcome);
+            }
+            Ok(LeaseCommand::Release { completed }) => return completed,
+            Err(_) => return None,
+        }
+    }
 }

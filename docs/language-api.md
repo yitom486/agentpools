@@ -17,6 +17,7 @@ The bindings expose the scheduler lifecycle as native async APIs:
 - construct a pool from `AcpPoolOptions`;
 - submit an ACP prompt to any available agent, or target an agent index;
 - await the response and cancel a task;
+- acquire an exclusive session for caller-side validation and correction;
 - inspect aggregate queue/active/closed status;
 - drain or cancel queued work, then close the pool.
 
@@ -25,6 +26,14 @@ An explicit `submitRetrying` / `submit_retrying` call also accepts a
 prepended as the next ACP prompt block. `maxAttempts` / `max_attempts` counts
 the initial call as attempt one. Retry remains adapter-gated: only a
 recoverable error on a synchronized session reaches the same worker/session.
+
+For validation after a successful response, use `acquire()` (optionally with
+an agent index), then call `lease.ask(prompt)` as often as needed. The lease
+holds its worker while application code validates the response, even when no
+agent call is active. `lease.finish()` releases it; Python also supports
+`async with await pool.acquire()`. Node and Python expose the selected worker
+as `agentIndex` and `agent_index`, respectively. A plain `submit` result does
+not reserve the worker after the result is delivered.
 
 ACP session setup is lazy: constructing the pool validates configuration and
 starts worker threads; an ACP process starts when its worker receives its first
@@ -93,14 +102,22 @@ language-native exceptions with the original error message.
 
 - One worker owns one session at a time; a submitted task and its retries keep
   that worker until the task succeeds, is abandoned, or is cancelled.
+- A session lease reserves the worker across successful responses and caller
+  validation. Later queued work cannot use that worker until `finish()` or
+  the lease is dropped. Other workers continue independently.
 - Retry is opt-in. Only errors for which the adapter reports the session is
   still synchronized may be retried on that same session.
+- A recoverable error during `lease.ask()` leaves the lease and session in
+  place. An uncertain error closes that session; the lease retains the worker,
+  and a later `ask()` opens a new session on it.
 - A normal failed prompt discards the uncertain session. The next task on that
   worker opens a fresh ACP process/session.
 - MCP config is session-scoped. Use separate agent entries or pools when tool
   sets differ; task submission does not infer tool compatibility.
 - Shutdown joins workers and closes sessions. ACP I/O timeouts bound that
-  operation; dropping a pool cancels queued work and waits for running calls.
+  operation; release all outstanding leases before closing the pool, because
+  shutdown waits for their workers. Dropping a pool cancels queued work and
+  waits for running calls.
 
 The Rust source of these serialized types is `agentpools_acp::{AcpPoolOptions,
 AcpAgentOptions, AcpTimeoutOptions, AcpPrompt, AcpResponse}`. JSON serialization

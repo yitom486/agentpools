@@ -1,7 +1,9 @@
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
-use agentpools::{AgentPool, CancellationToken, ShutdownMode, TaskHandle};
+use agentpools::{
+    AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode, TaskHandle,
+};
 use agentpools_acp::{AcpBackend, AcpError, AcpPoolOptions, AcpPrompt, AcpResponse};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -9,6 +11,8 @@ use serde_json::json;
 
 type Pool = AgentPool<AcpBackend>;
 type Handle = TaskHandle<AcpResponse, AcpError>;
+type AcpLeaseHandle = LeaseHandle<AcpBackend>;
+type AcpLease = SessionLease<AcpBackend>;
 
 #[pyclass(name = "NativeAgentPool")]
 struct PyAgentPool {
@@ -43,6 +47,23 @@ impl PyAgentPool {
         }
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         Ok(PyTask::new(handle))
+    }
+
+    fn request_lease(&self, agent_index: Option<u32>) -> PyResult<PyLeaseRequest> {
+        let pool = self.pool.lock().unwrap_or_else(|error| error.into_inner());
+        let pool = pool
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("agent pool is closed"))?;
+        let handle = if let Some(index) = agent_index {
+            pool.request_lease_to(index as usize)
+        } else {
+            pool.request_lease()
+        }
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(PyLeaseRequest {
+            cancellation: handle.cancellation_token(),
+            handle: Mutex::new(Some(handle)),
+        })
     }
 
     fn submit_retrying(
@@ -132,6 +153,81 @@ impl PyTask {
     }
 }
 
+#[pyclass(name = "NativeLeaseRequest")]
+struct PyLeaseRequest {
+    cancellation: CancellationToken,
+    handle: Mutex<Option<AcpLeaseHandle>>,
+}
+
+#[pymethods]
+impl PyLeaseRequest {
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn wait(&self, py: Python<'_>) -> PyResult<PySessionLease> {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("lease request can only be awaited once"))?;
+        let lease = py
+            .detach(move || handle.wait().map_err(|error| error.to_string()))
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(PySessionLease::new(lease))
+    }
+}
+
+#[pyclass(name = "NativeSessionLease")]
+struct PySessionLease {
+    agent_index: usize,
+    lease: Mutex<Option<AcpLease>>,
+}
+
+impl PySessionLease {
+    fn new(lease: AcpLease) -> Self {
+        Self {
+            agent_index: lease.agent_index(),
+            lease: Mutex::new(Some(lease)),
+        }
+    }
+}
+
+#[pymethods]
+impl PySessionLease {
+    #[getter]
+    fn agent_index(&self) -> usize {
+        self.agent_index
+    }
+
+    fn ask(&self, py: Python<'_>, prompt_json: &str) -> PyResult<String> {
+        let prompt = parse_prompt(prompt_json)?;
+        py.detach(move || {
+            let mut guard = self.lease.lock().unwrap_or_else(|error| error.into_inner());
+            let lease = guard
+                .as_mut()
+                .ok_or_else(|| "session lease is finished".to_string())?;
+            let response = lease.ask(prompt).map_err(|error| error.to_string())?;
+            serde_json::to_string(&response).map_err(|error| error.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+
+    fn finish(&self, py: Python<'_>) -> PyResult<()> {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(lease) = lease {
+            py.detach(move || lease.finish().map_err(|error| error.to_string()))
+                .map_err(PyRuntimeError::new_err)?;
+        }
+        Ok(())
+    }
+}
+
 #[pymethods]
 impl PyTask {
     #[getter]
@@ -196,5 +292,7 @@ fn render_feedback(template: &str, error: &AcpError, attempt: usize) -> String {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAgentPool>()?;
     module.add_class::<PyTask>()?;
+    module.add_class::<PyLeaseRequest>()?;
+    module.add_class::<PySessionLease>()?;
     Ok(())
 }

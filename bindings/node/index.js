@@ -15,8 +15,8 @@ function nativeSuffix() {
 function loadNative() {
   const suffix = nativeSuffix()
   const binaries = [
-    path.join(__dirname, 'agentpools.node'),
     path.join(__dirname, `agentpools.${suffix}.node`),
+    path.join(__dirname, 'agentpools.node'),
   ]
   for (const binary of binaries) {
     if (require('node:fs').existsSync(binary)) return require(binary)
@@ -62,6 +62,31 @@ class Task {
   }
 }
 
+class SessionLease {
+  constructor(nativeLease, agentIndex) {
+    this._native = nativeLease
+    this.agentIndex = agentIndex
+    this._tail = Promise.resolve()
+    this._finishing = false
+    this._finishPromise = null
+  }
+
+  async ask(prompt) {
+    if (this._finishing) throw new Error('session lease is finished')
+    const encoded = encodePrompt(prompt)
+    const call = this._tail.then(() => this._native.ask(encoded))
+    this._tail = call.then(() => undefined, () => undefined)
+    return JSON.parse(await call)
+  }
+
+  finish() {
+    if (this._finishPromise) return this._finishPromise
+    this._finishing = true
+    this._finishPromise = this._tail.then(() => this._native.finish()).then(() => undefined)
+    return this._finishPromise
+  }
+}
+
 class AgentPool {
   constructor(options) {
     if (!options || typeof options !== 'object') {
@@ -72,6 +97,17 @@ class AgentPool {
 
   submit(prompt, agentIndex) {
     return new Task(this._native.submit(encodePrompt(prompt), agentIndex))
+  }
+
+  async acquire(agentIndex) {
+    const nativeLease = this._native.requestLease(agentIndex)
+    try {
+      const selectedAgent = await nativeLease.ready()
+      return new SessionLease(nativeLease, selectedAgent)
+    } catch (error) {
+      nativeLease.cancel()
+      throw error
+    }
   }
 
   submitRetrying(prompt, { maxAttempts, feedbackTemplate, agentIndex } = {}) {
@@ -100,4 +136,4 @@ class AgentPool {
   }
 }
 
-module.exports = { AgentPool, Task }
+module.exports = { AgentPool, SessionLease, Task }
