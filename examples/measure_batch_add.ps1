@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('codex', 'codex-shared')]
-    [string]$Mode
+    [string]$Mode,
+    [switch]$DetailedProcessTrace
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,13 +49,21 @@ $peakProcessCount = 0
 $peakWorkingSet = [long]0
 $peakPrivateBytes = [long]0
 $peakNames = @()
+$peakProcesses = @()
+$observedProcesses = @{}
 $cpuByPid = @{}
 
 while ($true) {
     $benchmark.Refresh()
-    $processRows = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name)
+    $properties = @('ProcessId', 'ParentProcessId', 'Name')
+    if ($DetailedProcessTrace) {
+        $properties += @('ExecutablePath', 'CommandLine')
+    }
+    $processRows = @(Get-CimInstance Win32_Process -Property $properties)
     $children = @{}
+    $rowsByPid = @{}
     foreach ($row in $processRows) {
+        $rowsByPid[[int]$row.ProcessId] = $row
         $parentId = [int]$row.ParentProcessId
         if (-not $children.ContainsKey($parentId)) {
             $children[$parentId] = [System.Collections.Generic.List[int]]::new()
@@ -78,11 +87,62 @@ while ($true) {
     $live = @(Get-Process -Id $ids -ErrorAction SilentlyContinue)
     $workingSet = [long](($live | Measure-Object -Property WorkingSet64 -Sum).Sum)
     $privateBytes = [long](($live | Measure-Object -Property PrivateMemorySize64 -Sum).Sum)
+    $currentProcesses = @()
+    if ($DetailedProcessTrace) {
+        $nowMs = $timer.ElapsedMilliseconds
+        foreach ($item in $live) {
+            $row = $rowsByPid[[int]$item.Id]
+            if ($null -eq $row) { continue }
+            $parentId = [int]$row.ParentProcessId
+            $parent = $rowsByPid[$parentId]
+            $name = [IO.Path]::GetFileNameWithoutExtension([string]$row.Name)
+            $commandLine = [string]$row.CommandLine
+            $role = if ($name -eq 'node_repl') {
+                'codex-node-repl'
+            } elseif ($name -eq 'codex-code-mode-host') {
+                'codex-code-mode-host'
+            } elseif ($name -eq 'codex' -and $commandLine -match '(?i)\bapp-server\b') {
+                'codex-app-server'
+            } elseif ($commandLine -match '(?i)@agentclientprotocol[\\/]codex-acp[\\/]dist[\\/]index\.js') {
+                'codex-acp-node-adapter'
+            } elseif ($name -eq 'agentpools-mcp-add') {
+                'calculator-mcp'
+            } elseif ($name -eq 'node') {
+                'node-other'
+            } else {
+                'other'
+            }
+            $process = [ordered]@{
+                pid = [int]$item.Id
+                ppid = $parentId
+                name = $name
+                parent_name = if ($null -ne $parent) { [IO.Path]::GetFileNameWithoutExtension([string]$parent.Name) } else { 'unknown' }
+                executable = if ($row.ExecutablePath) { [IO.Path]::GetFileName([string]$row.ExecutablePath) } else { 'unknown' }
+                role = $role
+            }
+            $currentProcesses += [pscustomobject]$process
+            if (-not $observedProcesses.ContainsKey([int]$item.Id)) {
+                $observedProcesses[[int]$item.Id] = [ordered]@{
+                    pid = [int]$item.Id
+                    ppid = $parentId
+                    name = $name
+                    parent_name = $process.parent_name
+                    executable = $process.executable
+                    role = $role
+                    first_seen_ms = $nowMs
+                    last_seen_ms = $nowMs
+                }
+            } else {
+                $observedProcesses[[int]$item.Id]['last_seen_ms'] = $nowMs
+            }
+        }
+    }
 
     if ($live.Count -gt $peakProcessCount) { $peakProcessCount = $live.Count }
     if ($workingSet -gt $peakWorkingSet) {
         $peakWorkingSet = $workingSet
         $peakNames = @($live | ForEach-Object { $_.ProcessName } | Sort-Object)
+        if ($DetailedProcessTrace) { $peakProcesses = @($currentProcesses) }
     }
     if ($privateBytes -gt $peakPrivateBytes) { $peakPrivateBytes = $privateBytes }
     foreach ($item in $live) {
@@ -112,6 +172,10 @@ $summary = [ordered]@{
     process_names_at_peak = $peakNames
     stdout = $stdoutPath
     stderr = $stderrPath
+}
+if ($DetailedProcessTrace) {
+    $summary.processes_at_peak = $peakProcesses
+    $summary.process_lifetimes = @($observedProcesses.Values | Sort-Object first_seen_ms)
 }
 $summary | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $summaryPath -Encoding utf8
 $summary | ConvertTo-Json -Depth 4
