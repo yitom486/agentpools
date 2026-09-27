@@ -1,0 +1,161 @@
+name: Prepare or publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version already set in every package manifest (for example 0.1.0)
+        required: true
+        type: string
+      publish:
+        description: Publish to crates.io, npm, and PyPI after all builds pass
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Check package versions and publish ref
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          python scripts/check_release_versions.py "$RELEASE_VERSION"
+          if [[ "$PUBLISH" == 'true' && "$GITHUB_REF" != "refs/tags/v$RELEASE_VERSION" ]]; then
+            echo "Publishing requires running this workflow from tag v$RELEASE_VERSION" >&2
+            exit 1
+          fi
+        shell: bash
+
+  build:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+
+  stage-npm:
+    needs: build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: bindings/node
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install packaging CLI
+        run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: node-*
+          path: bindings/node/artifacts
+          merge-multiple: true
+      - name: Assemble platform packages
+        run: |
+          test "$(find artifacts -maxdepth 1 -name 'agentpools.*.node' | wc -l)" -eq 5
+          npm run release:collect
+          npm run release:prepare
+          mkdir -p dist
+          for package in npm/*; do
+            test -f "$package"/agentpools.*.node
+            (cd "$package" && npm pack --pack-destination ../../dist)
+          done
+          npm pack --pack-destination ./dist
+          test "$(find dist -maxdepth 1 -name '*.tgz' | wc -l)" -eq 6
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-npm
+          path: bindings/node/dist/*.tgz
+          if-no-files-found: error
+
+  stage-python:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: Check wheel set
+        run: test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 5
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-cargo:
+    if: inputs.publish
+    needs: [preflight, stage-npm, stage-python]
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish core crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p agentpools --locked
+      - name: Wait for core crate to reach the index
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          for attempt in {1..20}; do
+            if cargo info "agentpools@$RELEASE_VERSION" >/dev/null 2>&1; then exit 0; fi
+            sleep 30
+          done
+          echo "agentpools $RELEASE_VERSION did not reach crates.io in time" >&2
+          exit 1
+      - name: Publish ACP crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p agentpools-acp --locked
+
+  publish-npm:
+    if: inputs.publish
+    needs: publish-cargo
+    runs-on: ubuntu-24.04
+    environment: npm
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-npm
+          path: dist
+      - name: Publish platform packages, then root package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          for target in win32-x64-msvc linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64; do
+            npm publish "dist/agentpools-$target-$RELEASE_VERSION.tgz" --access public
+          done
+          npm publish "dist/agentpools-$RELEASE_VERSION.tgz" --access public
+        shell: bash
+
+  publish-pypi:
+    if: inputs.publish
+    needs: publish-npm
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -95,6 +95,8 @@ async with AgentPool({
 
 绑定目前源码可构建；npm 和 PyPI 尚未发布。当前本机已验证 Windows x64 构建，发布还需要在 CI 中构建并验证其余声明的平台目标。Cargo manifest 的许可证和仓库元数据也需要在发布前补齐。
 
+多平台 GitHub Actions 已配置为日常构建测试与手动发布准备。发布工作流默认只生成待检查的包；实际上传需要手动选择 `publish=true` 并从匹配的版本标签运行。设置凭据、检查产物和发布顺序见 [`docs/release.md`](docs/release.md)。
+
 - [Node.js package](bindings/node/README.md)：`npm install`、`npm run build`、`npm test`
 - [Python package](bindings/python/README.md)：安装 maturin 后运行 `maturin develop`，集成测试命令见该 README。
 
