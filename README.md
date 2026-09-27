@@ -2,6 +2,10 @@
 
 一个独立的 Rust Agent 会话池与任务调度库。它接收陆续提交的任务，最多同时运行指定数量的 Agent 会话，复用空闲会话，并支持有界队列、取消、按提交顺序收集结果和关闭清理。
 
+## 源码架构
+
+根 crate 的模块划分、各文件职责和请求流转过程见 [src/README.md](src/README.md)。拆分前的单文件版本保存在 [archive/lib.rs](archive/lib.rs)，供对照学习。
+
 ## 边界
 
 `agentpools` 只负责调度与会话所有权。调用方实现 `AgentBackend::open` 和 `AgentSession::{run, close}`，从而接入 ACP、HTTP API、本地进程或其他 Agent 协议。
