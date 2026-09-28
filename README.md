@@ -25,7 +25,7 @@ API v1 保持 ACP 配置；API v2 可按 worker 选择 ACP、Codex app-server �
 | 位置 | 主要内容 |
 | --- | --- |
 | [src/lib.rs](crates/agentpools-acp/src/lib.rs) | `AcpBackend`、`AcpConfig`、`AcpPrompt`、`AcpResponse`、`AcpSession` 和可选的宿主请求处理器。 |
-| [src/transport.rs](crates/agentpools-acp/src/transport.rs) | ACP 子进程的 stdio 与 JSON-RPC 消息收发。 |
+| [src/transport.rs](crates/agentpools-acp/src/transport.rs) | ACP 子进程的 stdio 传输（基于 [agentpools-transport](crates/agentpools-transport/README.md)）。 |
 | [src/shared_process.rs](crates/agentpools-acp/src/shared_process.rs) | 在 Agent 支持时，让多个独立会话共享一个进程。 |
 | [src/interop.rs](crates/agentpools-acp/src/interop.rs) | 绑定使用的 `AcpPoolOptions` 等 JSON 配置类型及建池入口。 |
 | [stdio 测试](crates/agentpools-acp/tests/stdio.rs)、[Codex 示例](crates/agentpools-acp/examples/codex.rs)、[批量示例](crates/agentpools-acp/examples/batch_add.rs) | 协议测试、真实 Agent 调用和批量任务报告。 |

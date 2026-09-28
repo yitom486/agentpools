@@ -18,10 +18,11 @@ The repository has two GitHub Actions workflows:
 1. Push this repository to GitHub. The workflows have not run remotely until
    then. Confirm the package names are available and fill in the intended
    license and repository metadata in the manifests.
-2. Keep `Cargo.toml`, `crates/agentpools-acp/Cargo.toml`,
-   `bindings/node/package.json`, every `bindings/node/npm/*/package.json`, and
-   `bindings/python/pyproject.toml` on the same version. Check with
-   `python scripts/check_release_versions.py 0.1.0` (substitute your version).
+2. Keep `Cargo.toml`, `crates/agentpools-transport/Cargo.toml`,
+   `crates/agentpools-acp/Cargo.toml`, `bindings/node/package.json`, every
+   `bindings/node/npm/*/package.json`, and `bindings/python/pyproject.toml` on the
+   same version. Check with `python scripts/check_release_versions.py 0.1.0`
+   (substitute your version).
 3. Configure the `crates-io` GitHub environment with a
    `CARGO_REGISTRY_TOKEN` secret, and the `npm` environment with an
    `NPM_TOKEN` secret. Configure PyPI Trusted Publishing for this GitHub
@@ -37,8 +38,8 @@ The repository has two GitHub Actions workflows:
    before any registry upload.
 
 The release workflow does not create a GitHub Release or a version tag. Cargo
-publishes the core crate before its ACP adapter and waits for the core version
-to appear in the registry. npm publishes platform packages before the root
+publishes the core crate and transport crate before the ACP adapter and waits for
+each version to appear in the registry. npm publishes platform packages before the root
 package. PyPI Trusted Publishing runs in a separate job after the other two
 registries succeed. Each registry is irreversible; a failure partway through
 requires inspecting which packages were published before rerunning.

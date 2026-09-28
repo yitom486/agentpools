@@ -60,15 +60,28 @@ cargo run -p agentpools-acp --example batch_add --all-features -- --codex-shared
 
 若题目或 MCP 校验不通过，示例仍会先写报告再返回错误。启动参数、辅助程序或配置在生成报告前就失败时，可能没有报告文件。`target/` 已被 Git 忽略，清理构建目录会删除这些运行产物；需要留档时应自行归档对应运行目录。
 
-Windows 上可用采样脚本比较真实模式。先构建示例，并在执行脚本的同一 Windows 用户身份下确认 `codex login status` 可用：
+跨平台（Linux、macOS、Windows）可使用 Python 采样脚本，Windows 上也可使用 PowerShell 脚本。先构建示例：
+
+```bash
+cargo build -p agentpools-acp --example batch_add --all-features
+python examples/measure_batch_add.py --mode mock
+```
+
+真实模式（需完成 `codex login` 并设置 `CODEX_ACP_ENTRY`）：
+
+```bash
+python examples/measure_batch_add.py --mode codex
+python examples/measure_batch_add.py --mode codex-shared
+```
+
+Windows PowerShell 专属脚本：
 
 ```powershell
-cargo build -p agentpools-acp --example batch_add --all-features
 .\examples\measure_batch_add.ps1 -Mode codex
 .\examples\measure_batch_add.ps1 -Mode codex-shared
 ```
 
-脚本在 `target/agentpools-batch-add-resource/` 写入 `.resources.json`、标准输出和错误输出。资源 JSON 包含退出码、墙钟耗时、采样到的进程树峰值进程数、工作集、私有内存和累计 CPU 秒数；传入 `-DetailedProcessTrace` 还会记录进程角色与寿命。采样间隔约 250 毫秒，峰值是采样值；进程树包含示例、ACP、MCP 及其子进程，因此不能把 `peak_process_count` 当成 ACP Agent 进程数。
+脚本在 `target/agentpools-batch-add-resource/` 写入 `.resources.json`、标准输出和错误输出。资源 JSON 包含退出码、墙钟耗时、采样到的进程树峰值进程数、工作集、私有内存和累计 CPU 秒数；传入 `--detailed-process-trace`（PowerShell 为 `-DetailedProcessTrace`）还会记录进程角色与寿命。采样间隔约 250 毫秒，峰值是采样值；进程树包含示例、ACP、MCP 及其子进程，因此不能把 `peak_process_count` 当成 ACP Agent 进程数。
 
 ## 现有本机报告示例
 
