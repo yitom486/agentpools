@@ -215,6 +215,7 @@ fn language_config_builds_pool_and_forwards_mcp_servers_to_acp() {
                 close_ms: 2_000,
             },
             inherit_stderr: false,
+            ephemeral: true,
         }],
         max_queued: 4,
     };

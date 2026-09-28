@@ -46,6 +46,8 @@ pub struct AcpAgentOptions {
     pub timeouts: AcpTimeoutOptions,
     #[serde(default)]
     pub inherit_stderr: bool,
+    #[serde(default = "default_true")]
+    pub ephemeral: bool,
 }
 
 /// ACP lifecycle timeout values, in milliseconds, for JSON interoperability.
@@ -167,6 +169,7 @@ impl AcpAgentOptions {
         config.prompt_timeout = Duration::from_millis(self.timeouts.prompt_ms);
         config.close_timeout = Duration::from_millis(self.timeouts.close_ms);
         config.inherit_stderr = self.inherit_stderr;
+        config.ephemeral = self.ephemeral;
         Ok(config)
     }
 }
@@ -223,6 +226,10 @@ fn default_close_timeout_ms() -> u64 {
     3_000
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +254,7 @@ mod tests {
                 model: Some("gpt-6-luna".into()),
                 timeouts: AcpTimeoutOptions::default(),
                 inherit_stderr: false,
+                ephemeral: true,
             }],
             max_queued: 12,
         };

@@ -156,12 +156,17 @@ impl SharedManager {
             }
         };
 
+        let mut session_new_params = json!({
+            "cwd": config.cwd.to_string_lossy(),
+            "mcpServers": config.mcp_servers
+        });
+        if config.ephemeral {
+            session_new_params["ephemeral"] = json!(true);
+        }
+
         let created = process.call(
             "session/new",
-            json!({
-                "cwd": config.cwd.to_string_lossy(),
-                "mcpServers": config.mcp_servers
-            }),
+            session_new_params,
             config.handshake_timeout,
             "session/new",
             None,
@@ -181,6 +186,7 @@ impl SharedManager {
             session_id,
             events,
             supports_close,
+            ephemeral: config.ephemeral,
             handler: config.host_handler.clone(),
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
@@ -231,6 +237,7 @@ pub struct SharedAcpSession {
     session_id: String,
     events: Receiver<Incoming>,
     supports_close: bool,
+    ephemeral: bool,
     handler: Option<Arc<dyn HostRequestHandler>>,
     prompt_timeout: Duration,
     close_timeout: Duration,
@@ -313,7 +320,20 @@ impl AgentSession<AcpPrompt, AcpResponse, AcpError> for SharedAcpSession {
             return Ok(());
         }
         self.closed = true;
-        let protocol_result = if self.supports_close {
+        let delete_result = if self.ephemeral {
+            let _ = self.call(
+                "session/delete",
+                json!({ "sessionId": self.session_id }),
+                self.close_timeout,
+                "session/delete",
+                None,
+                &mut |_| {},
+            );
+            Ok(())
+        } else {
+            Ok(())
+        };
+        let close_result = if self.supports_close {
             self.call(
                 "session/close",
                 json!({ "sessionId": self.session_id }),
@@ -327,7 +347,7 @@ impl AgentSession<AcpPrompt, AcpResponse, AcpError> for SharedAcpSession {
             Ok(())
         };
         self.process.unregister_session(&self.session_id);
-        protocol_result
+        delete_result.and(close_result)
     }
 
     fn can_retry_after(&self, error: &AcpError) -> bool {

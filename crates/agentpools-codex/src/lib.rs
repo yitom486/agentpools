@@ -266,6 +266,7 @@ impl CodexSession {
         let mut params = json!({
             "cwd": config.cwd.to_string_lossy(),
             "approvalPolicy": config.approval_policy,
+            "ephemeral": config.ephemeral,
         });
         if let Some(model) = &config.model {
             params["model"] = json!(model);

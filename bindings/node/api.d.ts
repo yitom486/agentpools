@@ -14,6 +14,7 @@ export interface AcpAgentOptions {
   model?: string | null
   timeouts?: AcpTimeouts
   inheritStderr?: boolean
+  ephemeral?: boolean
 }
 
 export interface AcpPoolOptions {

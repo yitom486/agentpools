@@ -55,6 +55,7 @@ pub struct AcpConfig {
     pub prompt_timeout: Duration,
     pub close_timeout: Duration,
     pub inherit_stderr: bool,
+    pub ephemeral: bool,
 }
 
 impl AcpConfig {
@@ -73,7 +74,13 @@ impl AcpConfig {
             prompt_timeout: Duration::from_secs(300),
             close_timeout: Duration::from_secs(3),
             inherit_stderr: false,
+            ephemeral: true,
         }
+    }
+
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
+        self
     }
 }
 
@@ -159,6 +166,7 @@ pub struct AcpSession {
     transport: Transport,
     session_id: String,
     supports_close: bool,
+    ephemeral: bool,
     handler: Option<Arc<dyn HostRequestHandler>>,
     prompt_timeout: Duration,
     close_timeout: Duration,
@@ -191,6 +199,7 @@ impl AcpSession {
             transport,
             session_id: String::new(),
             supports_close: false,
+            ephemeral: config.ephemeral,
             handler: config.host_handler.clone(),
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
@@ -227,12 +236,16 @@ impl AcpSession {
                 config.handshake_timeout,
             )?;
         }
+        let mut session_new_params = json!({
+            "cwd": config.cwd.to_string_lossy(),
+            "mcpServers": config.mcp_servers
+        });
+        if config.ephemeral {
+            session_new_params["ephemeral"] = json!(true);
+        }
         let created = session.call(
             "session/new",
-            json!({
-                "cwd": config.cwd.to_string_lossy(),
-                "mcpServers": config.mcp_servers
-            }),
+            session_new_params,
             config.handshake_timeout,
         )?;
         session.session_id = created
@@ -423,7 +436,17 @@ impl AgentSession<AcpPrompt, AcpResponse, AcpError> for AcpSession {
             return Ok(());
         }
         self.closed = true;
-        let protocol_result = if self.supports_close && !self.session_id.is_empty() {
+        let delete_result = if self.ephemeral && !self.session_id.is_empty() {
+            let _ = self.call(
+                "session/delete",
+                json!({ "sessionId": self.session_id }),
+                self.close_timeout,
+            );
+            Ok(())
+        } else {
+            Ok(())
+        };
+        let close_result = if self.supports_close && !self.session_id.is_empty() {
             self.call(
                 "session/close",
                 json!({ "sessionId": self.session_id }),
@@ -434,7 +457,7 @@ impl AgentSession<AcpPrompt, AcpResponse, AcpError> for AcpSession {
             Ok(())
         };
         let process_result = self.transport.terminate();
-        protocol_result.and(process_result)
+        delete_result.and(close_result).and(process_result)
     }
 
     fn can_retry_after(&self, error: &AcpError) -> bool {

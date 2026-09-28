@@ -203,6 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 respond(&mut output, id, json!({"stopReason":"end_turn"}))?;
             }
+            "session/delete" => {
+                respond(&mut output, id, json!({}))?;
+            }
             "session/close" => {
                 respond(&mut output, id, json!({}))?;
                 if scenario != "shared-concurrency" {
