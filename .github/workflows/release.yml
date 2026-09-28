@@ -169,7 +169,7 @@ jobs:
 
   publish-npm:
     if: inputs.publish
-    needs: publish-cargo
+    needs: stage-npm
     runs-on: ubuntu-24.04
     environment: npm
     steps:
@@ -194,7 +194,7 @@ jobs:
 
   publish-pypi:
     if: inputs.publish
-    needs: publish-npm
+    needs: stage-python
     runs-on: ubuntu-24.04
     environment: pypi
     permissions:
