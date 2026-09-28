@@ -32,6 +32,11 @@ API v1 保持 ACP 配置；API v2 可按 worker 选择 ACP、Codex app-server �
 
 应用仍需安装并指定 ACP Agent 的可执行入口。此适配层会把调用方提供的 `mcpServers` 配置传给 Agent；具体工具调用由 Agent 完成。详细配置和限制见 [ACP crate README](crates/agentpools-acp/README.md)。
 
+## 多运行时与底层传输
+
+- [`crates/agentpools-runtime/`](crates/agentpools-runtime/README.md)：支持按 worker 混合调度 ACP、Codex app-server 与 Pi RPC，提供统一文本接口、会话容错与协议级取消。
+- [`crates/agentpools-transport/`](crates/agentpools-transport/README.md)：提供跨平台（Windows、Linux、macOS）子进程生命周期管理、换行流解析与优雅退出保护。
+
 ## ACP 的两种运行模式
 
 Rust 调度核心始终为每个 worker 启动一个线程；Agent 子进程的数量由 ACP 适配器决定：
@@ -154,4 +159,4 @@ asyncio.run(main())
 
 ## 验证
 
-运行 `cargo test --workspace --all-features --offline`、`cargo clippy --workspace --all-targets --all-features --offline -- -D warnings`，以及两个语言包的 ACP mock 集成测试。4 worker / 16 道加法题的 mock 与真实 Agent 命令、通过条件、`report.json` / `report.html` 及 Windows 资源采样报告，见[运行模式与测试报告](docs/execution-modes-and-reports.md)。真实 Agent 测试需要认证并会消耗模型额度。
+运行 `cargo test --workspace --all-features --offline`、`cargo clippy --workspace --all-targets --all-features --offline -- -D warnings`，以及两个语言包的 ACP mock 集成测试。4 worker / 16 道加法题的 mock 与真实 Agent 命令、通过条件、`report.json` / `report.html` 及跨平台资源采样报告（`python examples/measure_batch_add.py` 与 PowerShell 脚本），见[运行模式与测试报告](docs/execution-modes-and-reports.md)。真实 Agent 测试需要认证并会消耗模型额度。

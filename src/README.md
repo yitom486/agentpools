@@ -6,7 +6,7 @@
 
 池管理有界租用队列和固定数量的 worker 线程。一次租用独占一个 worker：调用方可以多次向 Agent 发送请求，并在请求之间校验结果、准备反馈；直到调用 `finish()` 或丢弃 `SessionLease`，worker 才接下一项租用。每个 worker 按需创建自己的会话，并可在后续租用中复用。
 
-池负责调度和会话所有权。协议连接、工具、权限、模型及会话配置由 `AgentBackend` 和 `AgentSession` 的实现负责。ACP stdio 适配器位于 [agentpools-acp](../crates/agentpools-acp/README.md)；多运行时选择及 Codex app-server、Pi RPC 适配器位于 [agentpools-runtime](../crates/agentpools-runtime/src/lib.rs)。
+池负责调度和会话所有权。协议连接、工具、权限、模型及会话配置由 `AgentBackend` 和 `AgentSession` 的实现负责。底层跨平台 stdio 传输位于 [agentpools-transport](../crates/agentpools-transport/README.md)；ACP 适配器位于 [agentpools-acp](../crates/agentpools-acp/README.md)；多运行时选择及 Codex app-server、Pi RPC 适配器位于 [agentpools-runtime](../crates/agentpools-runtime/README.md)。
 
 多个不同的后端可以各自建池并同时运行。参见[多运行时接入设计](../docs/runtime-architecture.md)和[双后端示例](../examples/multiple_runtimes.rs)。
 
