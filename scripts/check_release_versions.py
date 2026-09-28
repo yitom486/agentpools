@@ -35,6 +35,7 @@ def main() -> int:
     versions = {
         "Cargo core": toml_version("Cargo.toml", "package"),
         "Cargo ACP": toml_version("crates/agentpools-acp/Cargo.toml", "package"),
+        "Cargo Codex": toml_version("crates/agentpools-codex/Cargo.toml", "package"),
         "Cargo Transport": toml_version("crates/agentpools-transport/Cargo.toml", "package"),
         "Cargo Runtime": toml_version("crates/agentpools-runtime/Cargo.toml", "package"),
         "Node": json_version(ROOT / "bindings/node/package.json"),

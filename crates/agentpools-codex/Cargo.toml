@@ -6,7 +6,7 @@ description = "Codex app-server adapter for agentpools with standalone, shared m
 readme = "README.md"
 
 [dependencies]
-agentpools = { path = "../.." }
+agentpools = { version = "0.1.0", path = "../.." }
 agentpools-transport = { version = "0.1.0", path = "../agentpools-transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
