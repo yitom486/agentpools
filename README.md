@@ -171,6 +171,7 @@ pool.shutdown(ShutdownMode::Drain);
 
 - 🧭 [多运行时接入设计 (架构设计思路)](docs/runtime-architecture.md)
 - 📝 [多运行时配置与使用说明 (API v2 指南)](docs/multi-runtime-usage.md)
+- 📦 [npm 打包分发原理与跨平台使用指南 (Node.js / Bun / TypeScript)](docs/npm-packaging-and-usage.md)
 - 📊 [运行模式与跨平台测试报告 (共享模式与基准压测)](docs/execution-modes-and-reports.md)
 - 📜 [语言绑定接口契约规范](docs/language-api.md)
 - 🚀 [构建与跨平台发版指南](docs/release.md)

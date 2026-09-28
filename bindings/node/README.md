@@ -96,6 +96,7 @@ try {
 
 ## 4. 详细文档指引
 
+- [npm 打包原理与多平台使用指南（Node.js / Bun / TypeScript）](../../docs/npm-packaging-and-usage.md)
 - [多运行时配置完全指南](../../docs/multi-runtime-usage.md)
 - [跨语言绑定契约](../../docs/language-api.md)
 - [调度核心设计](../../src/README.md)

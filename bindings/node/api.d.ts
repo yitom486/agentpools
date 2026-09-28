@@ -74,6 +74,7 @@ export interface CodexAppServerAgentOptions {
   model?: string | null
   timeouts?: NativeTimeouts
   inheritStderr?: boolean
+  ephemeral?: boolean
 }
 
 export interface PiRpcAgentOptions {
@@ -95,4 +96,5 @@ export interface MultiRuntimePoolOptions {
   apiVersion: 2
   agents: RuntimeAgentOptions[]
   maxQueued?: number
+  sharedProcess?: boolean
 }
