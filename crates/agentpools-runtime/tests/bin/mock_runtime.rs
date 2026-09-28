@@ -17,7 +17,17 @@ fn main() {
             match message["method"].as_str() {
                 Some("initialize") => emit(json!({"id":message["id"],"result":{}})),
                 Some("thread/start") => {
-                    emit(json!({"id":message["id"],"result":{"thread":{"id":"thread-1"}}}))
+                    let mcp_count = message
+                        .pointer("/params/config/mcp_servers")
+                        .and_then(Value::as_object)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let thread_id = if mcp_count > 0 {
+                        format!("thread-mcp-{mcp_count}")
+                    } else {
+                        "thread-1".to_string()
+                    };
+                    emit(json!({"id":message["id"],"result":{"thread":{"id":thread_id}}}));
                 }
                 Some("turn/start") => {
                     count += 1;
@@ -26,8 +36,18 @@ fn main() {
                         .pointer("/params/input/0/text")
                         .and_then(Value::as_str)
                         .unwrap();
+                    let thread_id = message
+                        .pointer("/params/threadId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let answer = if thread_id.starts_with("thread-mcp-") {
+                        let suffix = thread_id.strip_prefix("thread-").unwrap();
+                        format!("codex:{text}:{count}:{suffix}")
+                    } else {
+                        format!("codex:{text}:{count}")
+                    };
                     emit(
-                        json!({"method":"item/completed","params":{"turnId":turn_id,"item":{"type":"agentMessage","phase":"final_answer","text":format!("codex:{text}:{count}")}}}),
+                        json!({"method":"item/completed","params":{"turnId":turn_id,"item":{"type":"agentMessage","phase":"final_answer","text":answer}}}),
                     );
                     emit(json!({"id":message["id"],"result":{"turn":{"id":turn_id}}}));
                     emit(

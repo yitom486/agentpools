@@ -112,3 +112,137 @@ fn native_workers_handle_cancellation_and_reuse() {
     assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
 }
 
+#[test]
+fn codex_and_acp_support_unified_mcp_configurations() {
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+
+    // 1. Codex with array of MCP servers
+    let options_array = json!({
+        "apiVersion": 2,
+        "agents": [
+            {
+                "runtime": "codexAppServer",
+                "program": program,
+                "args": ["codex"],
+                "cwd": cwd,
+                "mcpServers": [
+                    {
+                        "name": "sqlite",
+                        "command": "uvx",
+                        "args": ["mcp-server-sqlite"]
+                    },
+                    {
+                        "name": "remote-api",
+                        "type": "http",
+                        "url": "https://mcp.example.com",
+                        "headers": [{"name": "Authorization", "value": "Bearer token"}]
+                    }
+                ]
+            }
+        ]
+    });
+    let mut pool = build_pool(&options_array.to_string()).unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let res = lease.ask(RuntimePrompt::text("query-db")).unwrap();
+    // mock_runtime echoes mcp count from thread_id
+    assert_eq!(res.text, "codex:query-db:1:mcp-2");
+    lease.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+
+    // 2. Codex with dictionary format (standard Codex style)
+    let options_dict = json!({
+        "apiVersion": 2,
+        "agents": [
+            {
+                "runtime": "codexAppServer",
+                "program": program,
+                "args": ["codex"],
+                "cwd": cwd,
+                "mcpServers": {
+                    "tool_one": {
+                        "command": "npx",
+                        "args": ["tool-one"]
+                    }
+                }
+            }
+        ]
+    });
+    let mut pool = build_pool(&options_dict.to_string()).unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let res = lease.ask(RuntimePrompt::text("run-tool")).unwrap();
+    assert_eq!(res.text, "codex:run-tool:1:mcp-1");
+    lease.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+
+    // 3. ACP accepting dictionary format and normalizing it
+    let options_acp = json!({
+        "apiVersion": 2,
+        "agents": [
+            {
+                "runtime": "acp",
+                "program": "lazy-acp-process",
+                "cwd": cwd,
+                "mcpServers": {
+                    "sqlite": {
+                        "command": "uvx",
+                        "args": ["mcp-server-sqlite"]
+                    }
+                }
+            }
+        ]
+    });
+    let pool = build_pool(&options_acp.to_string()).unwrap();
+    assert_eq!(pool.status().active, 0);
+
+    // 4. Pi rejects mcpServers gracefully
+    let options_pi = json!({
+        "apiVersion": 2,
+        "agents": [
+            {
+                "runtime": "piRpc",
+                "program": program,
+                "args": ["pi"],
+                "cwd": cwd,
+                "mcpServers": [
+                    { "name": "sqlite", "command": "uvx" }
+                ]
+            }
+        ]
+    });
+    let err = build_pool(&options_pi.to_string()).err().unwrap();
+    assert!(err.contains("Pi RPC runtime does not currently support dynamic mcpServers"));
+}
+
+#[test]
+fn rust_builder_api_configures_mcp_servers() {
+    use agentpools::{PoolConfig, ShutdownMode};
+    use agentpools_runtime::{McpServer, NativeConfig, RuntimeBackend, RuntimeConfig};
+
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+
+    let mcp = McpServer::stdio("sqlite", "uvx")
+        .with_arg("mcp-server-sqlite")
+        .with_env("SQLITE_PATH", "./app.db");
+
+    let config = NativeConfig::codex(program, cwd)
+        .with_arg("codex")
+        .with_mcp_server(mcp);
+
+    let mut pool = agentpools::AgentPool::new(
+        RuntimeBackend,
+        RuntimeConfig::Native(config),
+        PoolConfig {
+            workers: 1,
+            max_queued: 4,
+        },
+    )
+    .unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let res = lease.ask(RuntimePrompt::text("check")).unwrap();
+    assert_eq!(res.text, "codex:check:1:mcp-1");
+    lease.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+

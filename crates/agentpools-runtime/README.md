@@ -17,6 +17,28 @@
 - **`RuntimePrompt`**：接收 `content` 数组，当前原生适配器统一接受文本块（`RuntimePrompt::text(...)`）。
 - **`RuntimeResponse`**：返回统一的文本响应 `{ text: String, stop_reason: String }`。
 - **`RuntimeError`**：统一错误枚举，涵盖子进程拉起失败、I/O 故障、超时、取消及 Agent 远端错误（`Remote`）。
+- **`McpServer` & `McpTransport`**：统一的 MCP 工具服务器抽象，支持 stdio 子进程与 http/sse 远端端点。
+
+## 统一 MCP 工具注入
+
+无论是 ACP 还是 Codex app-server，均原生支持挂载 MCP（Model Context Protocol）工具。`agentpools-runtime` 提供跨运行时的双向兼容转换：
+
+- **ACP 运行时**：自动将 MCP 配置转换为 `session/new` 的 `params.mcpServers` 列表。
+- **Codex app-server**：自动将 MCP 配置转换为 `thread/start` 的 `params.config.mcp_servers` 字典，并自动完成名称转义。
+- **格式归一化**：在 API v2 配置中，无论是传入数组格式 `[{ "name": "sqlite", "command": "uvx" }]` 还是字典格式 `{ "sqlite": { "command": "uvx" } }`，系统均能自动兼容识别并抹平差异。
+
+```rust
+use agentpools_runtime::{McpServer, NativeConfig};
+
+// 通过 Rust Builder 声明
+let mcp = McpServer::stdio("sqlite", "uvx")
+    .with_arg("mcp-server-sqlite")
+    .with_env("SQLITE_PATH", "./app.db");
+
+let codex_config = NativeConfig::codex("codex", "/path/to/project")
+    .with_arg("app-server")
+    .with_mcp_server(mcp);
+```
 
 ## 会话恢复与真实取消
 

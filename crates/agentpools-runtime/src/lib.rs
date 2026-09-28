@@ -1,6 +1,9 @@
 //! Concrete runtime selection for language bindings. The scheduler remains protocol independent.
 
+mod mcp;
 mod process;
+
+pub use mcp::{McpServer, McpTransport, parse_mcp_servers};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -105,9 +108,89 @@ pub struct NativeConfig {
     env: BTreeMap<String, String>,
     cwd: PathBuf,
     model: Option<String>,
+    mcp_servers: Vec<McpServer>,
     handshake_timeout: Duration,
     prompt_timeout: Duration,
     inherit_stderr: bool,
+}
+
+impl NativeConfig {
+    /// Creates a configuration for a native Codex app-server runtime worker.
+    pub fn codex(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self::new(NativeKind::CodexAppServer, program, cwd)
+    }
+
+    /// Creates a configuration for a native Pi RPC runtime worker.
+    pub fn pi(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self::new(NativeKind::PiRpc, program, cwd)
+    }
+
+    fn new(kind: NativeKind, program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            kind,
+            program: program.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: cwd.into(),
+            model: None,
+            mcp_servers: Vec::new(),
+            handshake_timeout: Duration::from_millis(default_handshake_ms()),
+            prompt_timeout: Duration::from_millis(default_prompt_ms()),
+            inherit_stderr: false,
+        }
+    }
+
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_mcp_server(mut self, server: McpServer) -> Self {
+        self.mcp_servers.push(server);
+        self
+    }
+
+    pub fn with_mcp_servers<I>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = McpServer>,
+    {
+        self.mcp_servers.extend(servers);
+        self
+    }
+
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
+        self
+    }
+
+    pub fn with_inherit_stderr(mut self, inherit: bool) -> Self {
+        self.inherit_stderr = inherit;
+        self
+    }
 }
 
 pub enum RuntimeConfig {
@@ -219,6 +302,16 @@ impl CodexSession {
         let mut params = json!({"cwd": config.cwd, "approvalPolicy":"never"});
         if let Some(model) = &config.model {
             params["model"] = json!(model);
+        }
+        if !config.mcp_servers.is_empty() {
+            let mut mcp_map = serde_json::Map::new();
+            for server in &config.mcp_servers {
+                let (name, value) = server.to_codex_entry();
+                mcp_map.insert(name, value);
+            }
+            params["config"] = json!({
+                "mcp_servers": Value::Object(mcp_map)
+            });
         }
         process.send(&json!({"id":2,"method":"thread/start","params":params}))?;
         let result = process.response(2, deadline, None)?;
@@ -469,6 +562,8 @@ struct NativeAgentOptions {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    mcp_servers: Option<Value>,
+    #[serde(default)]
     timeouts: NativeTimeouts,
     #[serde(default)]
     inherit_stderr: bool,
@@ -516,6 +611,16 @@ impl NativeAgentOptions {
         if matches!(kind, NativeKind::PiRpc) && self.model.is_some() {
             return Err("set the Pi model through args, for example --model <id>".into());
         }
+        let mcp_servers = if let Some(mcp) = &self.mcp_servers {
+            parse_mcp_servers(mcp)?
+        } else {
+            Vec::new()
+        };
+        if matches!(kind, NativeKind::PiRpc) && !mcp_servers.is_empty() {
+            return Err(
+                "Pi RPC runtime does not currently support dynamic mcpServers configuration; configure tools via Pi extensions or args".into(),
+            );
+        }
         Ok(NativeConfig {
             kind,
             program: self.program,
@@ -523,6 +628,7 @@ impl NativeAgentOptions {
             env: self.env,
             cwd: self.cwd,
             model: self.model,
+            mcp_servers,
             handshake_timeout: Duration::from_millis(self.timeouts.handshake_ms),
             prompt_timeout: Duration::from_millis(self.timeouts.prompt_ms),
             inherit_stderr: self.inherit_stderr,
@@ -574,6 +680,13 @@ pub fn build_pool(config_json: &str) -> Result<AgentPool<RuntimeBackend>, String
                     .remove("runtime");
                 let config = match runtime.as_str() {
                     "acp" => {
+                        if let Some(mcp) = value.get("mcpServers") {
+                            let parsed = parse_mcp_servers(mcp)
+                                .map_err(|error| format!("agent {index}: {error}"))?;
+                            let acp_mcp: Vec<Value> =
+                                parsed.iter().map(McpServer::to_acp_value).collect();
+                            value["mcpServers"] = Value::Array(acp_mcp);
+                        }
                         let agent: AcpAgentOptions = serde_json::from_value(value)
                             .map_err(|error| format!("agent {index}: {error}"))?;
                         RuntimeConfig::Acp(
