@@ -1,40 +1,31 @@
-# Language binding API contract
+# 跨语言绑定规范与通信契约
 
-This document defines the shared configuration and task value shapes for the
-Node.js and Python bindings. Both bindings call the same Rust
-`agentpools` scheduler and `agentpools-runtime` adapter; they will not reimplement
-scheduling in JavaScript or Python.
+> 本文档规范 Node.js 与 Python 绑定对 Rust 调度核心 [`agentpools`](../src/README.md) 的跨语言交互接口。
+>
+> 核心原则：**调度与状态机 100% 由底层 Rust 内核管理，脚本层仅负责做薄封装与原生异步类型映射，严禁在 JavaScript 或 Python 中自行重新发明调度算法。**
 
-## Scope and versioning
+---
 
-API v1 is an ACP stdio process pool. Each item in `agents` owns one worker slot
-and one reusable ACP process/session. The config has an explicit `apiVersion`
-so bindings can reject unsupported contracts before spawning agents. Unknown
-fields are rejected to catch misspelled options.
+## 1. 架构与绑定技术栈
 
-This section describes the compatible ACP API v1. The bindings call
-`agentpools-runtime::build_pool`, which also accepts tagged API v2 configs for ACP,
-Codex app-server, and Pi RPC. See the [multi-runtime usage guide](multi-runtime-usage.md).
-The Rust ACP adapter also has
-an opt-in `SharedAcpBackend` / `AcpPoolOptions::build_shared()` path, where
-multiple worker sessions share one ACP process. The bindings do not expose
-that path or a JSON switch for it in API v1. See the
-[execution-mode guide](execution-modes-and-reports.md).
+```mermaid
+flowchart LR
+    Node["Node.js (N-API / napi-rs)"] -->|"C 语言 ABI"| Runtime["agentpools-runtime<br/>(build_pool 入口)"]
+    Py["Python (PyO3 / Maturin)"] -->|"CPython C-API"| Runtime
+    Runtime --> Core["agentpools 调度核心"]
+```
 
-The bindings expose the scheduler lifecycle as native async APIs:
+| 语言环境 | 绑定实现层 | 导出类型 | 异步范式 |
+| --- | --- | --- | --- |
+| **Node.js** | [`bindings/node`](../bindings/node/README.md) (`@napi-rs/cli`) | `AgentPool`, `SessionLease` | 原生 `Promise` / `async/await` |
+| **Python** | [`bindings/python`](../bindings/python/README.md) (`pyo3` + `maturin`) | `AgentPool`, `SessionLease` | 原生 `asyncio` + `async with` 上下文管理器 |
 
-- construct a pool from ACP API v1 or tagged runtime API v2 options;
-- acquire any worker or target an agent index;
-- call lease.ask(prompt), validate, and repeat while retaining that worker;
-- call lease.finish() or exit Python's async context to release it;
-- inspect status and close the pool.
+---
 
-The worker remains reserved while application code validates the response. A recoverable ACP error may be sent back as feedback in a later ask on the same session. An uncertain error closes the session; the lease keeps the worker and a later ask opens a fresh session. Node.js exposes the worker index as agentIndex, Python as agent_index.
+## 2. API 版本与配置结构
 
-Session setup is lazy: creating a pool starts worker threads, and acquiring a worker opens its ACP session. Release all leases before a draining shutdown.
-
-## Configuration shape
-
+### API v1（ACP 纯净版）
+专用于标准 ACP 协议工作流：
 ```json
 {
   "apiVersion": 1,
@@ -43,12 +34,9 @@ Session setup is lazy: creating a pool starts worker threads, and acquiring a wo
     {
       "program": "codex-acp",
       "args": ["--stdio"],
-      "env": {"CODEX_MODEL": "gpt-6-luna"},
+      "env": { "KEY": "VAL" },
       "cwd": "C:/work/project",
-      "mcpServers": [
-        {"name": "calculator", "command": "calculator-mcp", "args": []}
-      ],
-      "authMethod": null,
+      "mcpServers": [],
       "model": "gpt-6-luna",
       "timeouts": {
         "handshakeMs": 30000,
@@ -61,44 +49,29 @@ Session setup is lazy: creating a pool starts worker threads, and acquiring a wo
 }
 ```
 
-`maxQueued` defaults to 128. Timeout values use milliseconds and default to
-30,000 / 300,000 / 3,000 respectively. Every worker `cwd` must be absolute;
-commands and all three timeout values must be valid before a pool is created.
-Each configured agent corresponds to exactly one worker and ACP session slot.
+### API v2（多运行时混合模式，推荐）
+每个 agent 额外包含 `runtime` 字段，支持同时混用 `codexAppServer`、`piRpc`、`acp`，并支持统一的 `mcpServers`。详细说明见[多运行时使用指南](multi-runtime-usage.md)。
 
-The `mcpServers` array is opaque JSON. The adapter forwards its values to ACP
-`session/new`; the scheduler and bindings do not inspect, merge, or rewrite
-them. MCP server process launch and tool permissions remain the ACP agent's
-responsibility.
+---
 
-API v1 does not advertise ACP client capabilities. In particular, permission,
-filesystem, and terminal callbacks are not silently enabled. An ACP permission
-request without a host handler is answered as cancelled by the adapter. A
-future binding API can add explicit host callbacks without changing the
-versioned pool configuration.
+## 3. 语言层交互契约
 
-## Task values
+### ① 租借生命周期（Lease Lifecycle）
+- **`acquire([targetIndex])`**：
+  - 从池中借出一个 Worker；可不带参数（获取任意空闲 Worker），或传入索引（指定获取配置数组中第 N 个 Worker）。
+  - 返回独占的 `lease` 凭据。
+- **`lease.ask(prompt)`**：
+  - 在当前独占会话上执行一轮请求，返回 `{ text: string, stopReason: string }`。
+  - 同一个 lease 可以多次调用 `ask()`，历史上下文自动保留。
+- **`lease.finish()`**：
+  - 显式归还 Worker。归还前该 Worker 处于独占锁定状态，其它并发排队任务绝不插队。
+  - Python 中通过 `async with lease:` 自动隐式调用 `finish()`。
+- **`pool.close({ drain: true })`**：
+  - 关闭池。`drain: true` 表示排队任务全部处理完毕后再退出。
 
-An ACP prompt is an object with a `content` array of ACP content blocks. For a
-plain text task:
-
-```json
-{"content": [{"type": "text", "text": "add 2 and 3"}]}
-```
-
-The response has `text` and `stopReason` fields. The adapter currently
-assembles text updates into `text`; it does not expose raw ACP update events.
-Bindings should preserve that shape and report construction/task errors as
-language-native exceptions with the original error message.
-
-## Scheduler semantics bindings must preserve
-
-- A SessionLease owns one worker across all calls, validation, and feedback until finish or drop. Other workers continue independently.
-- Retry is a caller decision. The adapter allows original-session reuse only when the protocol remains synchronized.
-- An uncertain error closes the session; the lease stays on its worker, and the next ask opens a new session.
-- Queued leases are bounded and cancellable. Shutdown waits for active leases.
-- MCP configuration belongs to a session; use distinct agent entries or pools for distinct tool sets.
-
-The Rust source of these serialized types is `agentpools_acp::{AcpPoolOptions,
-AcpAgentOptions, AcpTimeoutOptions, AcpPrompt, AcpResponse}`. JSON serialization
-tests in the crate guard the camelCase field names and MCP pass-through shape.
+### ② 错误映射规则
+Rust 内部发生的错误在抛给高级语言时做统一映射：
+- **`BuildError`** → 启动前配置校验失败（如工作目录不存在、命令为空），抛出语法/参数异常。
+- **`AcquireError`** → 排队超限（超过 `maxQueued`）或队列已关闭，抛出资源占满异常。
+- **`Remote` 错误** → Agent 远端错误（如 429 限流），此时调用方可捕获并在同一个 `lease` 上直接调用 `ask` 重试。
+- **致命 I/O / 崩溃** → 抛出底层异常，Worker 会在下次调用时自动重建新会话。

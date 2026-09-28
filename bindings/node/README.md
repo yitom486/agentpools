@@ -1,77 +1,101 @@
-# agentpools for Node.js
+# `agentpools` Node.js 客户端指南
 
-Promise-based Node.js API backed by the shared Rust scheduler and ACP stdio, Codex app-server, and Pi RPC
-adapter. Each configured `agents` entry owns one persistent worker/session
-slot. Caller-provided `mcpServers` are passed through to ACP `session/new`.
+> 基于底层 Rust 高性能调度内核的 Node.js 客户端。
+>
+> 专为需要在 Node.js / TypeScript 环境下**高效、稳定管理多个长连接 AI Agent**（Codex、Pi、ACP）而设计，提供原生 Promise / async-await 接口。
 
-## Local development
+---
 
-Install Node.js 20 or newer, Rust, and the platform linker, then run:
+## 1. 核心特性
 
-```sh
+- **高性能底层驱动**：直接基于 Rust 原生线程与管道通信（通过 Node-API），性能高且内存开销极小。
+- **独占租用（Lease）保障**：支持多轮对话、中间异步校验，期间 Worker 槽位绝对锁定，杜绝并发插队污染上下文。
+- **多运行时与统一 MCP**：完全支持 API v2，可在同一个池中混合调度 Codex app-server、Pi RPC 和 ACP，并统一注入 MCP 工具。
+
+---
+
+## 2. 本地开发与构建
+
+环境要求：Node.js 20+，Rust 稳定版。
+
+```bash
+# 进入目录并安装依赖
+cd bindings/node
 npm install
+
+# 编译底层原生扩展
 npm run build
+
+# 运行自动化单元测试
 npm test
 ```
 
-## Example
+---
 
-```js
-const { AgentPool } = require('agentpools')
+## 3. 典型使用示例
 
-const pool = new AgentPool({
-  apiVersion: 1,
-  maxQueued: 32,
-  agents: [
-    { program: 'codex-acp', args: [], cwd: process.cwd(), model: 'gpt-6-luna' },
-  ],
-})
+### ① 基础使用与多轮交互
+```javascript
+const { AgentPool } = require('agentpools');
 
 async function main() {
+  // 1. 初始化池（支持 API v1 与 API v2）
+  const pool = new AgentPool({
+    apiVersion: 2,
+    maxQueued: 32,
+    agents: [
+      {
+        runtime: 'codexAppServer',
+        program: 'codex',
+        args: ['app-server'],
+        cwd: process.cwd(),
+      },
+    ],
+  });
+
   try {
-    const lease = await pool.acquire()
+    // 2. 租借一个 Worker
+    const lease = await pool.acquire();
     try {
-      console.log(await lease.ask('Add 2 and 3.'))
+      // 第一轮问答
+      const res1 = await lease.ask('请写一个快速排序算法。');
+      console.log('回复:', res1.text);
+
+      // 第二轮追问（历史上下文完整保留在同一进程中）
+      const res2 = await lease.ask('请为它添加单元测试用例。');
+      console.log('追问回复:', res2.text);
     } finally {
-      await lease.finish()
+      // 3. 释放租借，Worker 归还池中
+      await lease.finish();
     }
   } finally {
-    await pool.close({ drain: true })
+    // 4. 优雅关闭池
+    await pool.close({ drain: true });
   }
 }
 
-main().catch(console.error)
+main().catch(console.error);
 ```
 
-A lease holds its worker across calls. After a recoverable error, application code can send feedback with another lease.ask call.
-
-For validation in application code after an answer, reserve a worker with a
-session lease. The queued work cannot use that worker until `finish()`:
-
-```js
-const lease = await pool.acquire()
+### ② 多轮校验与循环修复（Code Review 模式）
+```javascript
+const lease = await pool.acquire();
 try {
-  let answer = await lease.ask('Create a draft')
-  while (needsCorrection(answer)) {
-    answer = await lease.ask(correctionFor(answer))
+  let reply = await lease.ask('实现用户注册接口');
+  
+  // 外部做业务沙箱测试，测试不通过则在同一会话中追问修改
+  while (await runTestSuitFailed(reply.text)) {
+    reply = await lease.ask('测试未通过，请检查边界条件并修复代码。');
   }
 } finally {
-  await lease.finish()
+  await lease.finish();
 }
 ```
 
-`pool.acquire(agentIndex)` can reserve a specific worker. Release all leases
-before calling `pool.close()`, which waits for active workers.
+---
 
-The workspace [language API contract](../../docs/language-api.md) describes
-configuration, lease, retry, and shutdown semantics. The npm
-package still needs its full platform build matrix and artifact collection
-test before publication. Build each configured target in CI, upload the
-platform-suffixed `.node` files into `artifacts/`, then run
-`npm run release:collect` and `npm run release:prepare`. These steps populate
-the per-platform packages and the root package's optional dependencies. Review
-the staged manifests before publishing the platform packages and then the root
-package. The checked-in platform manifests are generated under `npm/` by
-`napi create-npm-dirs`.
+## 4. 详细文档指引
 
-For API v2 Codex app-server, Pi RPC, and mixed-runtime configuration, see the [multi-runtime usage guide](../../docs/multi-runtime-usage.md).
+- [多运行时配置完全指南](../../docs/multi-runtime-usage.md)
+- [跨语言绑定契约](../../docs/language-api.md)
+- [调度核心设计](../../src/README.md)

@@ -1,88 +1,169 @@
-# 多运行时使用说明
+# 多运行时（API v2）使用完全指南
 
-`agentpools` 的 `apiVersion: 1` 配置保持原有 ACP 用法。`apiVersion: 2` 在每个 `agents` 条目上增加 `runtime`：`acp`、`codexAppServer` 或 `piRpc`。同一个池可以混合这些 worker。`acquire(index)` 中的索引对应 `agents` 数组的位置；租用期间的多次 `ask` 留在同一个 worker 和会话。只有会话状态不明的失败才会关闭旧会话，并在下一次调用时于原 worker 上重建。
+> 本指南介绍如何在同一个 Agent 进程池中混合调度 **Codex app-server**、**Pi RPC** 和 **ACP**，并在 Node.js、Python 及 Rust 中使用统一的数据结构与 MCP 工具。
 
-调用方需要另行安装并配置对应 Agent。`program` 指向可执行文件，`args` 是启动参数，`cwd` 必须是绝对路径。以下示例假设 `codex` 与 `pi` 已在 `PATH` 中，且各自已完成所需的认证和模型配置。Windows 上可将 Pi 的 `program` 指向 npm 安装生成的 `pi.cmd` 绝对路径。
+---
 
-当前原生适配器支持文本内容块和最终文本结果；`ask()` 返回 `{ text, stopReason }`。ACP 仍保留其原有内容块和 MCP 配置。Codex app-server 使用 `initialize`、`thread/start`、`turn/start` 和 `turn/completed`；Pi 使用 `--mode rpc` 的 JSONL `prompt`、消息事件和 `agent_settled`。原生适配器不会处理交互式审批或扩展 UI 请求：Codex 会话启动时指定 `approvalPolicy: "never"`，意外收到宿主交互请求会返回错误并关闭会话。为阻塞 I/O 设置有限的 `timeouts.handshakeMs` 和 `timeouts.promptMs`；默认为 30 秒和 300 秒。
+## 1. 核心概念与版本演进
 
-## Node.js
+- **`apiVersion: 1`（ACP 专有模式）**：适用于全量采用 ACP stdio 协议的场景，每个 Worker 独占一个 ACP 进程与会话。
+- **`apiVersion: 2`（多运行时统一模式）**：
+  - 允许在配置数组的每个 agent 节点上标注 `runtime` 字段（`codexAppServer`、`piRpc`、`acp`）；
+  - **支持同一池内异构混合**：Worker 0 可以是 Codex，Worker 1 可以是 Pi，Worker 2 可以是 ACP；
+  - **支持统一 MCP 工具注入**：用一套通用的 `mcpServers` 配置，底层自动转译适配；
+  - **支持定向获取**：`acquire(index)` 精确租借指定位置的 Worker。
 
-在仓库的 `bindings/node` 中运行 `npm install`、`npm run build`，或安装已构建的 npm 包。
+---
 
-```js
-const { AgentPool } = require('agentpools')
+## 2. 统一配置参考格式
 
-async function main() {
+```json
+{
+  "apiVersion": 2,
+  "maxQueued": 32,
+  "agents": [
+    {
+      "runtime": "codexAppServer",
+      "program": "codex",
+      "args": ["app-server"],
+      "cwd": "C:/work/project",
+      "model": "gpt-6-luna",
+      "mcpServers": [
+        {
+          "name": "sqlite",
+          "command": "uvx",
+          "args": ["mcp-server-sqlite", "--db-path", "./app.db"]
+        }
+      ]
+    },
+    {
+      "runtime": "piRpc",
+      "program": "pi",
+      "args": ["--mode", "rpc", "--model", "gemini-2.5-flash"],
+      "cwd": "C:/work/project"
+    },
+    {
+      "runtime": "acp",
+      "program": "npx",
+      "args": ["-y", "@agentclientprotocol/codex-acp"],
+      "cwd": "C:/work/project"
+    }
+  ]
+}
+```
+
+> [!NOTE]
+> `cwd` 必须为绝对路径。Windows 环境下，如果某些 CLI 是通过 npm 全局安装的命令（如 `pi.cmd`），建议直接传入可解析的命令名或全路径。
+
+---
+
+## 3. Node.js 完整接入示例
+
+安装与依赖：在项目根目录引用预编译好的 `agentpools` 包。
+
+```javascript
+const { AgentPool } = require('agentpools');
+
+async function run() {
+  // 1. 初始化多运行时池
   const pool = new AgentPool({
     apiVersion: 2,
     maxQueued: 16,
     agents: [
-      { runtime: 'codexAppServer', program: 'codex', args: ['app-server'], cwd: process.cwd() },
-      { runtime: 'piRpc', program: 'pi', args: ['--mode', 'rpc', '--no-session'], cwd: process.cwd() },
-    ],
-  })
-  try {
-    for (const index of [0, 1]) {
-      const lease = await pool.acquire(index)
-      try {
-        const first = await lease.ask('请简单介绍你自己。')
-        const second = await lease.ask('请接着上一轮，补充一句。')
-        console.log(index, first.text, second.text)
-      } finally {
-        await lease.finish()
+      {
+        runtime: 'codexAppServer',
+        program: 'codex',
+        args: ['app-server'],
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: 'sqlite', command: 'uvx', args: ['mcp-server-sqlite'] }
+        ]
+      },
+      {
+        runtime: 'piRpc',
+        program: 'pi',
+        args: ['--mode', 'rpc'],
+        cwd: process.cwd()
       }
+    ]
+  });
+
+  try {
+    // 2. 独占获取第一个 Worker（Codex）
+    const lease = await pool.acquire(0);
+    try {
+      // 连续多轮交互，上下文保持连贯
+      const reply1 = await lease.ask('请设计一个简单的数据库表结构。');
+      console.log('第一轮回复:', reply1.text);
+
+      const reply2 = await lease.ask('根据上面的表结构，写一个插入测试数据的 SQL。');
+      console.log('第二轮回复:', reply2.text);
+    } finally {
+      // 必须显式释放，Worker 才能接待下一个排队任务
+      await lease.finish();
     }
   } finally {
-    await pool.close({ drain: true })
+    // 优雅停机：等待排队请求完成后退出
+    await pool.close({ drain: true });
   }
 }
 
-main().catch(console.error)
+run().catch(console.error);
 ```
 
-## Python
+---
 
-在仓库的 `bindings/python` 中运行 `maturin develop`，或安装已构建的 wheel。
+## 4. Python 完整接入示例
+
+基于 Python 的 `async with` 上下文管理器，资源的释放更加优雅与自动化：
 
 ```python
 import asyncio
 import os
 from agentpools import AgentPool
 
-
 async def main():
-    async with AgentPool({
+    config = {
         "apiVersion": 2,
         "maxQueued": 16,
         "agents": [
-            {"runtime": "codexAppServer", "program": "codex", "args": ["app-server"], "cwd": os.getcwd()},
-            {"runtime": "piRpc", "program": "pi", "args": ["--mode", "rpc", "--no-session"], "cwd": os.getcwd()},
-        ],
-    }) as pool:
-        for index in (0, 1):
-            async with await pool.acquire(index) as lease:
-                first = await lease.ask("请简单介绍你自己。")
-                second = await lease.ask("请接着上一轮，补充一句。")
-                print(index, first["text"], second["text"])
+            {
+                "runtime": "codexAppServer",
+                "program": "codex",
+                "args": ["app-server"],
+                "cwd": os.getcwd(),
+                "mcpServers": [
+                    {"name": "sqlite", "command": "uvx", "args": ["mcp-server-sqlite"]}
+                ]
+            },
+            {
+                "runtime": "piRpc",
+                "program": "pi",
+                "args": ["--mode", "rpc"],
+                "cwd": os.getcwd()
+            }
+        ]
+    }
 
+    # 1. 启动 Agent 进程池
+    async with AgentPool(config) as pool:
+        # 2. 定向获取第二个 Worker（Pi）
+        async with await pool.acquire(1) as lease:
+            reply = await lease.ask("请简要介绍你自己以及擅长的工作。")
+            print("Pi Agent 回复:", reply["text"])
+            
+            # 多轮对话保持同一会话状态
+            follow_up = await lease.ask("请用一句话总结。")
+            print("总结:", follow_up["text"])
 
 asyncio.run(main())
 ```
 
-## ACP 与混合配置
+---
 
-在 API v2 中，ACP worker 的字段沿用 API v1，只增加 `runtime: "acp"`：
+## 5. 错误处理与重试语义
 
-```json
-{
-  "apiVersion": 2,
-  "agents": [
-    { "runtime": "acp", "program": "codex-acp", "args": [], "cwd": "/absolute/project" },
-    { "runtime": "codexAppServer", "program": "codex", "args": ["app-server"], "cwd": "/absolute/project" },
-    { "runtime": "piRpc", "program": "pi", "args": ["--mode", "rpc"], "cwd": "/absolute/project" }
-  ]
-}
-```
-
-原来的无 `runtime`、`apiVersion: 1` ACP 配置继续可用。原生适配器目前只接收 `content` 中的文本块；图片等非文本内容会得到明确错误，且不会发送到 Agent。`model` 可用于 Codex app-server；Pi 的模型通过启动参数 `--model` 指定。
+- **`Remote` 错误（如模型限流 429）**：
+  - 底层 stdio 管道仍保持正常同步，调用方**无需重新 acquire**，直接在原 lease 上继续发送下一次 `ask` 即可重试，不会丢掉历史上下文。
+- **不可恢复错误（如子进程崩溃）**：
+  - 适配器会自动关闭旧管道，但当前 Worker 依然为该租用保留；下一次 `ask` 会自动触发安全冷启动，重新建立新会话，防止排队的其他任务插队。

@@ -142,8 +142,8 @@ pool.shutdown(ShutdownMode::Drain);
    - **Codex app-server**：OpenAI / Codex 原生客户端协议；
    - **Pi RPC**：Pi Agent 的 `--mode rpc` 模式；
    - **混部调度**：同一个池内支持配置不同类型的 Agent，按需分配。
-2. **MCP (Model Context Protocol) 零侵入透传**：
-   - 适配层会把你配置的 `mcpServers`（工具服务器、环境变量等）原封不动透传给 Agent，调度池本身不污染、不篡改你的工具协议。
+2. **MCP (Model Context Protocol) 统一注入与双向转译**：
+   - 支持跨 ACP 与 Codex app-server 的统一工具注入；无论传入数组格式还是字典格式，适配层自动归一化转译为对应协议所需格式，无感挂载。
 3. **全平台进程生命周期与真·取消保障**：
    - 传统取消只是在宿主端提前返回，后台子进程依然在疯狂消耗 Token；
    - `agentpools` 在调用取消时，会真正向子进程下发协议级取消信号（Codex 的 `turn/interrupt`、Pi 的 `abort`、ACP 的 `session/cancel`），不浪费 GPU 算力。
@@ -158,9 +158,10 @@ pool.shutdown(ShutdownMode::Drain);
 | 模块 | 目录 | 职责说明 |
 | :--- | :--- | :--- |
 | **调度核心** | [`src/`](src/README.md) | 纯粹的调度器，管理线程池、等待队列与租约生命周期（零外部依赖）。 |
+| **子 Crate 索引** | [`crates/`](crates/README.md) | 包含底层管道、ACP 协议适配与多运行时适配器的架构索引。 |
 | **底层传输** | [`crates/agentpools-transport/`](crates/agentpools-transport/README.md) | 跨平台子进程拉起、换行缓冲与退出强杀保护。 |
 | **ACP 适配器** | [`crates/agentpools-acp/`](crates/agentpools-acp/README.md) | ACP v1 协议实现，包含单进程多路复用共享后端。 |
-| **多运行时** | [`crates/agentpools-runtime/`](crates/agentpools-runtime/README.md) | 统一 ACP、Codex app-server 与 Pi RPC 的文本消息与真实取消。 |
+| **多运行时** | [`crates/agentpools-runtime/`](crates/agentpools-runtime/README.md) | 统一 ACP、Codex app-server 与 Pi RPC 的文本消息、真实取消与 MCP 注入。 |
 | **Node.js 绑定** | [`bindings/node/`](bindings/node/README.md) | 基于 `napi-rs`，提供完整的 TypeScript 类型定义。 |
 | **Python 绑定** | [`bindings/python/`](bindings/python/README.md) | 基于 `PyO3`，支持 `async with` 上下文管理。 |
 
