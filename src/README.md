@@ -106,10 +106,10 @@ let report = pool.shutdown(ShutdownMode::Drain);
 
 ## 5. 延伸阅读与测试
 
-- **底层 IPC 进程通道**：了解子进程如何安全拉起、换行缓冲与退出保底强杀，见 [`agentpools-transport`](../crates/agentpools-transport/README.md)。
+- **底层 IPC 进程通道**：了解子进程如何安全拉起、换行缓冲与退出保底强杀，见 [`agentpools-transport`](crates/agentpools-transport/README.md)。
 - **真实 Agent 协议接入**：
-  - ACP 协议适配器：[`agentpools-acp`](../crates/agentpools-acp/README.md)
-  - Codex / Pi / 多协议统一适配器：[`agentpools-runtime`](../crates/agentpools-runtime/README.md)
+  - ACP 协议适配器：[`agentpools-acp`](crates/agentpools-acp/README.md)
+  - Codex / Pi / 多协议统一适配器：[`agentpools-runtime`](crates/agentpools-runtime/README.md)
 - **调度单元与集成测试**：
-  - 查看纯调度独占与并发测试：[`tests/pool.rs`](../tests/pool.rs)
-  - 查看全生命周期端到端测试：[`crates/agentpools-runtime/tests/native.rs`](../crates/agentpools-runtime/tests/native.rs)
+  - 查看纯调度独占与并发测试：[`tests/pool.rs`](tests/pool.rs)
+  - 查看全生命周期端到端测试：[`crates/agentpools-runtime/tests/native.rs`](crates/agentpools-runtime/tests/native.rs)
