@@ -1,0 +1,443 @@
+//! Native stdio Codex app-server adapter for [`agentpools`].
+//!
+//! Provides both standalone process-per-worker ([`CodexBackend`]) and
+//! multiplexed single-process multi-session ([`SharedCodexBackend`]) execution.
+//!
+//! Sessions default to ephemeral mode (`ephemeral: true`), which permanently
+//! deletes the session and its local rollout history from disk via `thread/delete`
+//! upon closure.
+
+mod shared;
+
+pub use shared::{SharedCodexBackend, SharedCodexSession};
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use agentpools::{AgentBackend, AgentSession, CancellationToken};
+use agentpools_transport::{JsonProcess, ProcessConfig, TransportError};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+/// Configuration for Codex app-server workers.
+#[derive(Debug, Clone)]
+pub struct CodexConfig {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    /// Opaque JSON object mapping MCP server names to server configurations,
+    /// passed to `thread/start.params.config.mcp_servers`.
+    pub mcp_servers: Option<Value>,
+    /// Approval policy for model actions (default `"never"`).
+    pub approval_policy: String,
+    /// If `true` (the default), permanently deletes the session from disk on
+    /// close via `thread/delete`, preventing session accumulation.
+    pub ephemeral: bool,
+    pub handshake_timeout: Duration,
+    pub prompt_timeout: Duration,
+    pub close_timeout: Duration,
+    pub inherit_stderr: bool,
+}
+
+impl CodexConfig {
+    pub fn new(program: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: cwd.into(),
+            model: None,
+            mcp_servers: None,
+            approval_policy: "never".to_string(),
+            ephemeral: true,
+            handshake_timeout: Duration::from_secs(30),
+            prompt_timeout: Duration::from_secs(300),
+            close_timeout: Duration::from_secs(5),
+            inherit_stderr: false,
+        }
+    }
+
+    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_mcp_servers(mut self, servers: Value) -> Self {
+        self.mcp_servers = Some(servers);
+        self
+    }
+
+    pub fn with_approval_policy(mut self, policy: impl Into<String>) -> Self {
+        self.approval_policy = policy.into();
+        self
+    }
+
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
+        self
+    }
+
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
+        self
+    }
+
+    pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
+
+    pub fn with_inherit_stderr(mut self, inherit: bool) -> Self {
+        self.inherit_stderr = inherit;
+        self
+    }
+}
+
+/// Prompt input for Codex sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexPrompt {
+    pub content: Vec<Value>,
+}
+
+impl CodexPrompt {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![json!({"type": "text", "text": text.into()})],
+        }
+    }
+
+    pub fn extract_text(&self) -> Result<String, CodexError> {
+        let mut text = Vec::with_capacity(self.content.len());
+        for block in &self.content {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                return Err(CodexError::UnsupportedPrompt);
+            }
+            text.push(
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(CodexError::UnsupportedPrompt)?
+                    .to_owned(),
+            );
+        }
+        Ok(text.join("\n"))
+    }
+}
+
+/// Response returned by a Codex session turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexResponse {
+    pub text: String,
+    pub stop_reason: String,
+}
+
+#[derive(Debug)]
+pub enum CodexError {
+    InvalidConfig(&'static str),
+    Spawn(io::Error),
+    Io(io::Error),
+    Protocol(String),
+    Remote(String),
+    Timeout(&'static str),
+    Cancelled,
+    UnsupportedPrompt,
+    NoOutput,
+}
+
+impl fmt::Display for CodexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(msg) => write!(f, "invalid Codex config: {msg}"),
+            Self::Spawn(err) => write!(f, "cannot start Codex app-server: {err}"),
+            Self::Io(err) => write!(f, "Codex app-server I/O failed: {err}"),
+            Self::Protocol(msg) => write!(f, "Codex app-server protocol failed: {msg}"),
+            Self::Remote(err) => write!(f, "Codex app-server returned error: {err}"),
+            Self::Timeout(stage) => write!(f, "Codex app-server {stage} timed out"),
+            Self::Cancelled => write!(f, "Codex request cancelled"),
+            Self::UnsupportedPrompt => write!(f, "Codex currently accepts only text content blocks"),
+            Self::NoOutput => write!(f, "Codex returned no text"),
+        }
+    }
+}
+
+impl std::error::Error for CodexError {}
+
+impl From<TransportError> for CodexError {
+    fn from(err: TransportError) -> Self {
+        match err {
+            TransportError::Spawn(e) => Self::Spawn(e),
+            TransportError::Io(e) => Self::Io(e),
+            TransportError::Protocol(msg) => Self::Protocol(msg),
+            TransportError::Remote(msg) => Self::Remote(msg),
+            TransportError::Timeout => Self::Timeout("request"),
+            TransportError::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Standalone backend where each session owns an isolated `codex app-server` process.
+#[derive(Default, Clone, Copy)]
+pub struct CodexBackend;
+
+impl AgentBackend for CodexBackend {
+    type Config = CodexConfig;
+    type Request = CodexPrompt;
+    type Response = CodexResponse;
+    type Error = CodexError;
+    type Session = CodexSession;
+
+    fn open(&self, config: &Self::Config) -> Result<Self::Session, Self::Error> {
+        CodexSession::open(config)
+    }
+}
+
+/// A standalone Codex session running in a dedicated child process.
+pub struct CodexSession {
+    process: JsonProcess,
+    thread_id: String,
+    next_id: u64,
+    ephemeral: bool,
+    prompt_timeout: Duration,
+    close_timeout: Duration,
+    closed: bool,
+}
+
+impl CodexSession {
+    pub fn open(config: &CodexConfig) -> Result<Self, CodexError> {
+        let process_config = ProcessConfig {
+            program: config.program.clone(),
+            args: config.args.iter().map(OsString::from).collect(),
+            env: config
+                .env
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect(),
+            cwd: config.cwd.clone(),
+            inherit_stderr: config.inherit_stderr,
+        };
+        let mut process = JsonProcess::spawn(&process_config)?;
+        let deadline = Instant::now() + config.handshake_timeout;
+        process.send(&json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "agentpools-codex",
+                    "title": "agentpools-codex",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }))?;
+        process.response(1, deadline, None)?;
+        process.send(&json!({"method": "initialized", "params": {}}))?;
+
+        let mut params = json!({
+            "cwd": config.cwd.to_string_lossy(),
+            "approvalPolicy": config.approval_policy,
+        });
+        if let Some(model) = &config.model {
+            params["model"] = json!(model);
+        }
+        if let Some(mcp) = &config.mcp_servers {
+            params["config"] = json!({ "mcp_servers": mcp });
+        }
+
+        process.send(&json!({
+            "id": 2,
+            "method": "thread/start",
+            "params": params
+        }))?;
+        let result = process.response(2, deadline, None)?;
+        let thread_id = result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CodexError::Protocol("thread/start returned no thread id".into()))?
+            .to_owned();
+
+        Ok(Self {
+            process,
+            thread_id,
+            next_id: 3,
+            ephemeral: config.ephemeral,
+            prompt_timeout: config.prompt_timeout,
+            close_timeout: config.close_timeout,
+            closed: false,
+        })
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+}
+
+impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
+    fn run(
+        &mut self,
+        request: CodexPrompt,
+        cancellation: &CancellationToken,
+    ) -> Result<CodexResponse, CodexError> {
+        if self.closed {
+            return Err(CodexError::Protocol("session already closed".into()));
+        }
+        let text = request.extract_text()?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.process.send(&json!({
+            "id": id,
+            "method": "turn/start",
+            "params": {
+                "threadId": self.thread_id,
+                "input": [{"type": "text", "text": text}]
+            }
+        }))?;
+        let deadline = Instant::now() + self.prompt_timeout;
+        let result = self.process.response(id, deadline, Some(cancellation))?;
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CodexError::Protocol("turn/start returned no turn id".into()))?
+            .to_owned();
+
+        let mut answer = String::new();
+        let mut cancel_sent = false;
+
+        loop {
+            if cancellation.is_cancelled() && !cancel_sent {
+                let cancel_id = self.next_id;
+                self.next_id += 1;
+                let _ = self.process.send(&json!({
+                    "id": cancel_id,
+                    "method": "turn/interrupt",
+                    "params": {
+                        "threadId": self.thread_id,
+                        "turnId": turn_id
+                    }
+                }));
+                cancel_sent = true;
+            }
+
+            let event = match self.process.next_event(deadline, cancellation) {
+                Ok(event) => event,
+                Err(TransportError::Cancelled) if !cancel_sent => {
+                    let cancel_id = self.next_id;
+                    self.next_id += 1;
+                    let _ = self.process.send(&json!({
+                        "id": cancel_id,
+                        "method": "turn/interrupt",
+                        "params": {
+                            "threadId": self.thread_id,
+                            "turnId": turn_id
+                        }
+                    }));
+                    return Err(CodexError::Cancelled);
+                }
+                Err(error) => return Err(CodexError::from(error)),
+            };
+
+            if event.get("id").is_some() && event.get("method").is_some() {
+                return Err(CodexError::Protocol(
+                    "app-server requested an unsupported host interaction".into(),
+                ));
+            }
+
+            match event.get("method").and_then(Value::as_str) {
+                Some("item/completed")
+                    if event
+                        .pointer("/params/turnId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|val| val == turn_id) =>
+                {
+                    let item = &event["params"]["item"];
+                    if item["type"] == "agentMessage"
+                        && item["phase"]
+                            .as_str()
+                            .is_none_or(|p| p == "final_answer")
+                        && let Some(text) = item["text"].as_str()
+                    {
+                        answer = text.to_owned();
+                    }
+                }
+                Some("turn/completed")
+                    if event.pointer("/params/turn/id").and_then(Value::as_str)
+                        == Some(turn_id.as_str()) =>
+                {
+                    let turn = &event["params"]["turn"];
+                    if turn["status"] != "completed" {
+                        return Err(CodexError::Remote(turn["error"].to_string()));
+                    }
+                    if answer.is_empty() {
+                        return Err(CodexError::NoOutput);
+                    }
+                    return Ok(CodexResponse {
+                        text: answer,
+                        stop_reason: "completed".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<(), CodexError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        if self.ephemeral && !self.thread_id.is_empty() {
+            let delete_id = self.next_id;
+            self.next_id += 1;
+            let _ = self.process.send(&json!({
+                "id": delete_id,
+                "method": "thread/delete",
+                "params": {
+                    "threadId": self.thread_id
+                }
+            }));
+            let deadline = Instant::now() + self.close_timeout;
+            let _ = self.process.response(delete_id, deadline, None);
+        }
+        self.process.close().map_err(CodexError::from)
+    }
+
+    fn can_retry_after(&self, error: &CodexError) -> bool {
+        !self.closed && matches!(error, CodexError::Remote(_) | CodexError::UnsupportedPrompt)
+    }
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}

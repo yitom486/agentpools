@@ -16,6 +16,10 @@ use agentpools_acp::{
     AcpAgentOptions, AcpBackend, AcpConfig, AcpError, AcpPoolOptions, AcpPrompt, AcpResponse,
     AcpSession,
 };
+pub use agentpools_codex::{
+    CodexBackend, CodexConfig, CodexError, CodexPrompt, CodexResponse, CodexSession,
+    SharedCodexBackend, SharedCodexSession,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -46,6 +50,15 @@ pub struct RuntimeResponse {
 
 impl From<AcpResponse> for RuntimeResponse {
     fn from(response: AcpResponse) -> Self {
+        Self {
+            text: response.text,
+            stop_reason: response.stop_reason,
+        }
+    }
+}
+
+impl From<CodexResponse> for RuntimeResponse {
+    fn from(response: CodexResponse) -> Self {
         Self {
             text: response.text,
             stop_reason: response.stop_reason,
@@ -95,7 +108,22 @@ impl std::error::Error for RuntimeError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+impl From<CodexError> for RuntimeError {
+    fn from(error: CodexError) -> Self {
+        match error {
+            CodexError::Spawn(e) => Self::Spawn(e),
+            CodexError::Io(e) => Self::Io(e),
+            CodexError::Protocol(msg) => Self::Protocol(msg),
+            CodexError::Remote(msg) => Self::Remote(msg),
+            CodexError::Timeout(_) => Self::Timeout,
+            CodexError::Cancelled => Self::Cancelled,
+            CodexError::UnsupportedPrompt => Self::UnsupportedPrompt,
+            CodexError::NoOutput => Self::NoOutput,
+            CodexError::InvalidConfig(msg) => Self::Protocol(msg.to_string()),
+        }
+    }
+}
+
 enum NativeKind {
     CodexAppServer,
     PiRpc,
@@ -109,6 +137,7 @@ pub struct NativeConfig {
     cwd: PathBuf,
     model: Option<String>,
     mcp_servers: Vec<McpServer>,
+    ephemeral: bool,
     handshake_timeout: Duration,
     prompt_timeout: Duration,
     inherit_stderr: bool,
@@ -134,6 +163,7 @@ impl NativeConfig {
             cwd: cwd.into(),
             model: None,
             mcp_servers: Vec::new(),
+            ephemeral: true,
             handshake_timeout: Duration::from_millis(default_handshake_ms()),
             prompt_timeout: Duration::from_millis(default_prompt_ms()),
             inherit_stderr: false,
@@ -177,6 +207,11 @@ impl NativeConfig {
         self
     }
 
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
+        self
+    }
+
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -191,16 +226,43 @@ impl NativeConfig {
         self.inherit_stderr = inherit;
         self
     }
+
+    pub fn to_codex_config(&self) -> CodexConfig {
+        let mut config = CodexConfig::new(&self.program, &self.cwd)
+            .with_args(&self.args)
+            .with_handshake_timeout(self.handshake_timeout)
+            .with_prompt_timeout(self.prompt_timeout)
+            .with_inherit_stderr(self.inherit_stderr)
+            .with_ephemeral(self.ephemeral);
+
+        for (k, v) in &self.env {
+            config = config.with_env(k, v);
+        }
+        if let Some(model) = &self.model {
+            config = config.with_model(model);
+        }
+        if !self.mcp_servers.is_empty() {
+            let mut mcp_map = serde_json::Map::new();
+            for server in &self.mcp_servers {
+                let (name, value) = server.to_codex_entry();
+                mcp_map.insert(name, value);
+            }
+            config = config.with_mcp_servers(Value::Object(mcp_map));
+        }
+        config
+    }
 }
 
 pub enum RuntimeConfig {
     Acp(AcpConfig),
     Native(NativeConfig),
+    SharedCodex(SharedCodexBackend, CodexConfig),
 }
 
 pub enum RuntimeSession {
     Acp(AcpSession),
     Codex(CodexSession),
+    SharedCodex(SharedCodexSession),
     Pi(PiSession),
 }
 
@@ -221,9 +283,18 @@ impl AgentBackend for RuntimeBackend {
                 .map(RuntimeSession::Acp)
                 .map_err(RuntimeError::Acp),
             RuntimeConfig::Native(config) => match config.kind {
-                NativeKind::CodexAppServer => CodexSession::open(config).map(RuntimeSession::Codex),
+                NativeKind::CodexAppServer => {
+                    let codex_config = config.to_codex_config();
+                    CodexSession::open(&codex_config)
+                        .map(RuntimeSession::Codex)
+                        .map_err(RuntimeError::from)
+                }
                 NativeKind::PiRpc => PiSession::open(config).map(RuntimeSession::Pi),
             },
+            RuntimeConfig::SharedCodex(backend, config) => backend
+                .open(config)
+                .map(RuntimeSession::SharedCodex)
+                .map_err(RuntimeError::from),
         }
     }
 }
@@ -244,7 +315,24 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
                 )
                 .map(RuntimeResponse::from)
                 .map_err(RuntimeError::Acp),
-            Self::Codex(session) => session.run(request, cancellation),
+            Self::Codex(session) => session
+                .run(
+                    CodexPrompt {
+                        content: request.content,
+                    },
+                    cancellation,
+                )
+                .map(RuntimeResponse::from)
+                .map_err(RuntimeError::from),
+            Self::SharedCodex(session) => session
+                .run(
+                    CodexPrompt {
+                        content: request.content,
+                    },
+                    cancellation,
+                )
+                .map(RuntimeResponse::from)
+                .map_err(RuntimeError::from),
             Self::Pi(session) => session.run(request, cancellation),
         }
     }
@@ -252,7 +340,8 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
     fn close(&mut self) -> Result<(), RuntimeError> {
         match self {
             Self::Acp(session) => session.close().map_err(RuntimeError::Acp),
-            Self::Codex(session) => session.process.close(),
+            Self::Codex(session) => session.close().map_err(RuntimeError::from),
+            Self::SharedCodex(session) => session.close().map_err(RuntimeError::from),
             Self::Pi(session) => session.process.close(),
         }
     }
@@ -262,6 +351,7 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
             (Self::Acp(session), RuntimeError::Acp(error)) => session.can_retry_after(error),
             (_, RuntimeError::UnsupportedPrompt) => true,
             (Self::Codex(_), RuntimeError::Remote(_)) => true,
+            (Self::SharedCodex(_), RuntimeError::Remote(_)) => true,
             (Self::Pi(_), RuntimeError::Remote(_)) => true,
             _ => false,
         }
@@ -283,142 +373,6 @@ fn text_prompt(prompt: RuntimePrompt) -> Result<String, RuntimeError> {
         );
     }
     Ok(text.join("\n"))
-}
-
-pub struct CodexSession {
-    process: JsonProcess,
-    thread_id: String,
-    next_id: u64,
-    prompt_timeout: Duration,
-}
-
-impl CodexSession {
-    fn open(config: &NativeConfig) -> Result<Self, RuntimeError> {
-        let mut process = JsonProcess::spawn(config)?;
-        let deadline = Instant::now() + config.handshake_timeout;
-        process.send(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"agentpools","title":"agentpools","version":"0.1.0"}}}))?;
-        process.response(1, deadline, None)?;
-        process.send(&json!({"method":"initialized","params":{}}))?;
-        let mut params = json!({"cwd": config.cwd, "approvalPolicy":"never"});
-        if let Some(model) = &config.model {
-            params["model"] = json!(model);
-        }
-        if !config.mcp_servers.is_empty() {
-            let mut mcp_map = serde_json::Map::new();
-            for server in &config.mcp_servers {
-                let (name, value) = server.to_codex_entry();
-                mcp_map.insert(name, value);
-            }
-            params["config"] = json!({
-                "mcp_servers": Value::Object(mcp_map)
-            });
-        }
-        process.send(&json!({"id":2,"method":"thread/start","params":params}))?;
-        let result = process.response(2, deadline, None)?;
-        let thread_id = result
-            .pointer("/thread/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::Protocol("thread/start returned no thread id".into()))?
-            .to_owned();
-        Ok(Self {
-            process,
-            thread_id,
-            next_id: 3,
-            prompt_timeout: config.prompt_timeout,
-        })
-    }
-
-    fn run(
-        &mut self,
-        prompt: RuntimePrompt,
-        cancellation: &CancellationToken,
-    ) -> Result<RuntimeResponse, RuntimeError> {
-        let text = text_prompt(prompt)?;
-        let id = self.next_id;
-        self.next_id += 1;
-        self.process.send(&json!({"id":id,"method":"turn/start","params":{"threadId":self.thread_id,"input":[{"type":"text","text":text}]}}))?;
-        let deadline = Instant::now() + self.prompt_timeout;
-        let result = self.process.response(id, deadline, Some(cancellation))?;
-        let turn_id = result
-            .pointer("/turn/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::Protocol("turn/start returned no turn id".into()))?
-            .to_owned();
-        let mut answer = String::new();
-        let mut cancel_sent = false;
-        loop {
-            if cancellation.is_cancelled() && !cancel_sent {
-                let cancel_id = self.next_id;
-                self.next_id += 1;
-                let _ = self.process.send(&json!({
-                    "id": cancel_id,
-                    "method": "turn/interrupt",
-                    "params": {
-                        "threadId": self.thread_id,
-                        "turnId": turn_id
-                    }
-                }));
-                cancel_sent = true;
-            }
-            let event = match self.process.next_event(deadline, cancellation) {
-                Ok(event) => event,
-                Err(RuntimeError::Cancelled) if !cancel_sent => {
-                    let cancel_id = self.next_id;
-                    self.next_id += 1;
-                    let _ = self.process.send(&json!({
-                        "id": cancel_id,
-                        "method": "turn/interrupt",
-                        "params": {
-                            "threadId": self.thread_id,
-                            "turnId": turn_id
-                        }
-                    }));
-                    return Err(RuntimeError::Cancelled);
-                }
-                Err(error) => return Err(error),
-            };
-            if event.get("id").is_some() && event.get("method").is_some() {
-                return Err(RuntimeError::Protocol(
-                    "app-server requested an unsupported host interaction".into(),
-                ));
-            }
-            match event.get("method").and_then(Value::as_str) {
-                Some("item/completed")
-                    if event
-                        .pointer("/params/turnId")
-                        .and_then(Value::as_str)
-                        .is_none_or(|value| value == turn_id) =>
-                {
-                    let item = &event["params"]["item"];
-                    if item["type"] == "agentMessage"
-                        && item["phase"]
-                            .as_str()
-                            .is_none_or(|phase| phase == "final_answer")
-                        && let Some(text) = item["text"].as_str()
-                    {
-                        answer = text.to_owned();
-                    }
-                }
-                Some("turn/completed")
-                    if event.pointer("/params/turn/id").and_then(Value::as_str)
-                        == Some(turn_id.as_str()) =>
-                {
-                    let turn = &event["params"]["turn"];
-                    if turn["status"] != "completed" {
-                        return Err(RuntimeError::Remote(turn["error"].to_string()));
-                    }
-                    if answer.is_empty() {
-                        return Err(RuntimeError::NoOutput);
-                    }
-                    return Ok(RuntimeResponse {
-                        text: answer,
-                        stop_reason: "completed".into(),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
 }
 
 pub struct PiSession {
@@ -548,6 +502,8 @@ struct V2PoolOptions {
     agents: Vec<Value>,
     #[serde(default = "default_max_queued")]
     max_queued: usize,
+    #[serde(default)]
+    shared_process: bool,
 }
 
 #[derive(Deserialize)]
@@ -563,10 +519,16 @@ struct NativeAgentOptions {
     model: Option<String>,
     #[serde(default)]
     mcp_servers: Option<Value>,
+    #[serde(default = "default_true")]
+    ephemeral: bool,
     #[serde(default)]
     timeouts: NativeTimeouts,
     #[serde(default)]
     inherit_stderr: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -629,6 +591,7 @@ impl NativeAgentOptions {
             cwd: self.cwd,
             model: self.model,
             mcp_servers,
+            ephemeral: self.ephemeral,
             handshake_timeout: Duration::from_millis(self.timeouts.handshake_ms),
             prompt_timeout: Duration::from_millis(self.timeouts.prompt_ms),
             inherit_stderr: self.inherit_stderr,
@@ -667,6 +630,11 @@ pub fn build_pool(config_json: &str) -> Result<AgentPool<RuntimeBackend>, String
             if options.api_version != 2 {
                 return Err("expected apiVersion 2".into());
             }
+            let shared_codex = if options.shared_process {
+                Some(SharedCodexBackend::new())
+            } else {
+                None
+            };
             let mut agents = Vec::with_capacity(options.agents.len());
             for (index, mut value) in options.agents.into_iter().enumerate() {
                 let runtime = value
@@ -695,17 +663,24 @@ pub fn build_pool(config_json: &str) -> Result<AgentPool<RuntimeBackend>, String
                                 .map_err(|error| error.to_string())?,
                         )
                     }
-                    "codexAppServer" | "piRpc" => {
-                        let kind = if runtime == "codexAppServer" {
-                            NativeKind::CodexAppServer
+                    "codexAppServer" => {
+                        let agent: NativeAgentOptions = serde_json::from_value(value)
+                            .map_err(|error| format!("agent {index}: {error}"))?;
+                        let native_config = agent
+                            .into_config(NativeKind::CodexAppServer)
+                            .map_err(|error| format!("agent {index}: {error}"))?;
+                        if let Some(shared) = &shared_codex {
+                            RuntimeConfig::SharedCodex(shared.clone(), native_config.to_codex_config())
                         } else {
-                            NativeKind::PiRpc
-                        };
+                            RuntimeConfig::Native(native_config)
+                        }
+                    }
+                    "piRpc" => {
                         let agent: NativeAgentOptions = serde_json::from_value(value)
                             .map_err(|error| format!("agent {index}: {error}"))?;
                         RuntimeConfig::Native(
                             agent
-                                .into_config(kind)
+                                .into_config(NativeKind::PiRpc)
                                 .map_err(|error| format!("agent {index}: {error}"))?,
                         )
                     }

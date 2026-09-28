@@ -18,10 +18,12 @@ impl From<TransportError> for RuntimeError {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct JsonProcess {
     inner: TransportProcess,
 }
 
+#[allow(dead_code)]
 impl JsonProcess {
     pub(crate) fn spawn(config: &NativeConfig) -> Result<Self, RuntimeError> {
         let process_config = ProcessConfig {

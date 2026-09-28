@@ -11,12 +11,14 @@ fn emit(value: Value) {
 fn main() {
     let mode = std::env::args().nth(1).expect("mock mode");
     let mut count = 0;
+    let mut thread_count = 0;
     for line in io::stdin().lock().lines() {
         let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
         if mode == "codex" {
             match message["method"].as_str() {
                 Some("initialize") => emit(json!({"id":message["id"],"result":{}})),
                 Some("thread/start") => {
+                    thread_count += 1;
                     let mcp_count = message
                         .pointer("/params/config/mcp_servers")
                         .and_then(Value::as_object)
@@ -25,7 +27,7 @@ fn main() {
                     let thread_id = if mcp_count > 0 {
                         format!("thread-mcp-{mcp_count}")
                     } else {
-                        "thread-1".to_string()
+                        format!("thread-{thread_count}")
                     };
                     emit(json!({"id":message["id"],"result":{"thread":{"id":thread_id}}}));
                 }
@@ -47,14 +49,17 @@ fn main() {
                         format!("codex:{text}:{count}")
                     };
                     emit(
-                        json!({"method":"item/completed","params":{"turnId":turn_id,"item":{"type":"agentMessage","phase":"final_answer","text":answer}}}),
+                        json!({"method":"item/completed","params":{"threadId":thread_id,"turnId":turn_id,"item":{"type":"agentMessage","phase":"final_answer","text":answer}}}),
                     );
                     emit(json!({"id":message["id"],"result":{"turn":{"id":turn_id}}}));
                     emit(
-                        json!({"method":"turn/completed","params":{"turn":{"id":turn_id,"status":"completed"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":thread_id,"turn":{"id":turn_id,"status":"completed"}}}),
                     );
                 }
                 Some("turn/interrupt") => {
+                    emit(json!({"id":message["id"],"result":{}}));
+                }
+                Some("thread/delete") => {
                     emit(json!({"id":message["id"],"result":{}}));
                 }
                 _ => {}

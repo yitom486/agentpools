@@ -246,3 +246,58 @@ fn rust_builder_api_configures_mcp_servers() {
     assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
 }
 
+#[test]
+fn shared_codex_app_server_multiplexes_sessions() {
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+    let options = json!({
+        "apiVersion": 2,
+        "sharedProcess": true,
+        "maxQueued": 4,
+        "agents": [
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd,"ephemeral":true},
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd,"ephemeral":true}
+        ]
+    });
+    let mut pool = build_pool(&options.to_string()).unwrap();
+    let mut w1 = pool.acquire_to(0).unwrap();
+    let mut w2 = pool.acquire_to(1).unwrap();
+    assert_eq!(pool.status().active, 2);
+
+    let res1 = w1.ask(RuntimePrompt::text("task-1")).unwrap();
+    assert_eq!(res1.text, "codex:task-1:1");
+
+    let res2 = w2.ask(RuntimePrompt::text("task-2")).unwrap();
+    assert_eq!(res2.text, "codex:task-2:2");
+
+    w1.finish().unwrap();
+    w2.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+
+#[test]
+fn codex_ephemeral_flag_is_configurable() {
+    use agentpools::ShutdownMode;
+    use agentpools_runtime::NativeConfig;
+
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+
+    let cfg = NativeConfig::codex(program, cwd.clone()).with_ephemeral(false);
+    let codex_cfg = cfg.to_codex_config();
+    assert!(!codex_cfg.ephemeral);
+
+    let options_true = json!({
+        "apiVersion": 2,
+        "agents": [
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd,"ephemeral":true}
+        ]
+    });
+    let mut pool = build_pool(&options_true.to_string()).unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let res = lease.ask(RuntimePrompt::text("hello ephemeral")).unwrap();
+    assert_eq!(res.text, "codex:hello ephemeral:1");
+    lease.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+

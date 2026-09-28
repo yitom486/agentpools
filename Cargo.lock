@@ -19,6 +19,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentpools-codex"
+version = "0.1.0"
+dependencies = [
+ "agentpools",
+ "agentpools-transport",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "agentpools-node"
 version = "0.1.0"
 dependencies = [
@@ -46,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "agentpools",
  "agentpools-acp",
+ "agentpools-codex",
  "agentpools-transport",
  "serde",
  "serde_json",
