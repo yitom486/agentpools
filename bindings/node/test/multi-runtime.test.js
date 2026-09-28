@@ -31,3 +31,27 @@ test('API v2 uses Codex and Pi workers in the same pool', { skip: !fs.existsSync
     await pool.close()
   }
 })
+
+test('API v2 supports sharedProcess multiplexing and ephemeral sessions for Codex', { skip: !fs.existsSync(mock) }, async () => {
+  const pool = new AgentPool({
+    apiVersion: 2,
+    sharedProcess: true,
+    agents: [
+      { runtime: 'codexAppServer', program: mock, args: ['codex'], cwd: root, ephemeral: true },
+      { runtime: 'codexAppServer', program: mock, args: ['codex'], cwd: root, ephemeral: true },
+    ],
+  })
+  try {
+    const l1 = await pool.acquire(0)
+    const l2 = await pool.acquire(1)
+    try {
+      assert.equal((await l1.ask('alpha')).text, 'codex:alpha:1')
+      assert.equal((await l2.ask('beta')).text, 'codex:beta:2')
+    } finally {
+      await l1.finish()
+      await l2.finish()
+    }
+  } finally {
+    await pool.close()
+  }
+})

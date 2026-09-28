@@ -11,3 +11,5 @@
 /bindings/node/index.d.ts
 /bindings/node/native.d.ts
 /bindings/node/native.js
+**/*.pdb
+

@@ -23,3 +23,21 @@ class MultiRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 async with await pool.acquire(index) as lease:
                     self.assertEqual((await lease.ask("hello"))["text"], f"{prefix}:hello:1")
                     self.assertEqual((await lease.ask("again"))["text"], f"{prefix}:again:2")
+
+    async def test_api_v2_shared_process_and_ephemeral_codex(self):
+        async with AgentPool({
+            "apiVersion": 2,
+            "sharedProcess": True,
+            "agents": [
+                {"runtime": "codexAppServer", "program": str(MOCK), "args": ["codex"], "cwd": str(ROOT), "ephemeral": True},
+                {"runtime": "codexAppServer", "program": str(MOCK), "args": ["codex"], "cwd": str(ROOT), "ephemeral": True},
+            ],
+        }) as pool:
+            l1 = await pool.acquire(0)
+            l2 = await pool.acquire(1)
+            try:
+                self.assertEqual((await l1.ask("task-1"))["text"], "codex:task-1:1")
+                self.assertEqual((await l2.ask("task-2"))["text"], "codex:task-2:2")
+            finally:
+                await l1.finish()
+                await l2.finish()
