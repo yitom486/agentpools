@@ -100,6 +100,7 @@ jobs:
 
   publish-cargo:
     if: inputs.publish
+    continue-on-error: true
     needs: [preflight, stage-npm, stage-python]
     runs-on: ubuntu-24.04
     environment: crates-io
@@ -186,14 +187,16 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          cd dist
           for target in win32-x64-msvc linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64; do
-            npm publish "dist/agentpools-$target-$RELEASE_VERSION.tgz" --access public
+            npm publish "./agentpools-$target-$RELEASE_VERSION.tgz" --access public
           done
-          npm publish "dist/agentpools-$RELEASE_VERSION.tgz" --access public
+          npm publish "./agentpools-$RELEASE_VERSION.tgz" --access public
         shell: bash
 
   publish-pypi:
     if: inputs.publish
+    continue-on-error: true
     needs: stage-python
     runs-on: ubuntu-24.04
     environment: pypi
