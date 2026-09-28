@@ -1,0 +1,79 @@
+use agentpools::ShutdownMode;
+
+use agentpools_runtime::{RuntimePrompt, build_pool};
+use serde_json::json;
+
+#[test]
+fn mixed_native_workers_keep_their_own_sessions() {
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+    let options = json!({
+        "apiVersion": 2,
+        "maxQueued": 4,
+        "agents": [
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd},
+            {"runtime":"piRpc","program":program,"args":["pi"],"cwd":cwd}
+        ]
+    });
+    let mut pool = build_pool(&options.to_string()).unwrap();
+    let mut codex = pool.acquire_to(0).unwrap();
+    let mut pi = pool.acquire_to(1).unwrap();
+    assert_eq!(pool.status().active, 2);
+    assert_eq!(
+        codex.ask(RuntimePrompt::text("hello")).unwrap().text,
+        "codex:hello:1"
+    );
+    assert_eq!(
+        codex.ask(RuntimePrompt::text("again")).unwrap().text,
+        "codex:again:2"
+    );
+    assert_eq!(
+        pi.ask(RuntimePrompt::text("hello")).unwrap().text,
+        "pi:hello:1"
+    );
+    assert_eq!(
+        pi.ask(RuntimePrompt::text("again")).unwrap().text,
+        "pi:again:2"
+    );
+    codex.finish().unwrap();
+    pi.finish().unwrap();
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+
+#[test]
+fn v2_rejects_unknown_runtime_and_non_text_prompts() {
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+    let unknown =
+        json!({"apiVersion":2,"agents":[{"runtime":"unknown","program":program,"cwd":cwd}]});
+    assert!(build_pool(&unknown.to_string()).is_err());
+    let options = json!({"apiVersion":2,"agents":[{"runtime":"piRpc","program":program,"args":["pi"],"cwd":cwd}]});
+    let mut pool = build_pool(&options.to_string()).unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let prompt = RuntimePrompt {
+        content: vec![json!({"type":"image","data":"..."})],
+    };
+    assert!(lease.ask(prompt).is_err());
+    assert_eq!(
+        lease.ask(RuntimePrompt::text("valid")).unwrap().text,
+        "pi:valid:1"
+    );
+    lease.finish().unwrap();
+    let _ = pool.shutdown(ShutdownMode::Drain);
+}
+
+#[test]
+fn acp_configuration_works_in_both_api_versions() {
+    let cwd = std::env::current_dir().unwrap();
+    for version in [1, 2] {
+        let agent = if version == 1 {
+            json!({"program":"lazy-acp-process","cwd":cwd})
+        } else {
+            json!({"runtime":"acp","program":"lazy-acp-process","cwd":cwd})
+        };
+        let options = json!({"apiVersion":version,"agents":[agent]});
+        let mut pool = build_pool(&options.to_string()).unwrap();
+        assert_eq!(pool.status().active, 0);
+        let _ = pool.shutdown(ShutdownMode::CancelPending);
+    }
+}

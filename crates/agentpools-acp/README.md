@@ -4,6 +4,8 @@
 
 若 ACP Agent 的单个进程支持多个并行 session，可以显式选用 `SharedAcpBackend`，或对 JSON 配置调用 `AcpPoolOptions::build_shared()`。共享后端只启动一个 ACP 进程并复用该进程的认证连接；独立的 `sessionId`、请求 ID 路由和事件队列让各 worker 并发工作。各 agent 配置必须使用相同的程序、参数、环境变量、认证方式和客户端能力；`cwd`、`mcp_servers`、模型与会话超时可以各自不同。工作目录隔离仍由调用方提供；共享进程不会替调用方创建 worktree 或沙箱。原有 `AcpBackend` 和 `build()` 行为不变。
 
+两种模式都有每个 worker 一个 Rust 线程。“一个共享进程”只指 ACP Agent 进程；MCP server 与 Agent 派生的子进程另计。拓扑选择、绑定支持范围和报告字段见[运行模式与测试报告](../../docs/execution-modes-and-reports.md)。
+
 调用方提供 `AcpConfig` 的命令、工作目录、环境变量和 `mcp_servers`。MCP 配置作为 `session/new.params.mcpServers` 传给 Agent；默认不向 Agent 声明客户端文件系统或终端能力。需要响应 Agent 发起的权限、文件或终端请求时，调用方实现 `HostRequestHandler` 并显式设置相应的 `client_capabilities`。未配置处理器时，权限请求会取消，其他客户端请求会被拒绝。
 
 ## Codex ACP
@@ -35,7 +37,7 @@ cargo build -p agentpools-acp --features mcp-example --bin agentpools-mcp-add
 cargo test -p agentpools-acp --all-features
 ```
 
-mock 的 `recover-on-feedback` 场景先返回 ACP 错误，再接受包含错误反馈的第二条 prompt。`submit_retrying` 在同一个 worker 和 ACP session 内完成这两次调用；只对完整收到的远端 JSON-RPC 错误允许就地重试，I/O、超时、取消和协议错误会关闭会话。
+mock 的 `recover-on-feedback` 场景先返回 ACP 错误，再接受包含错误反馈的第二条 prompt。调用方持有 SessionLease 并通过两次 ask 在同一个 worker 和 ACP session 内完成；只对完整收到的远端 JSON-RPC 错误允许就地重试，I/O、超时、取消和协议错误会关闭会话。
 
 ## 4 个 Agent、16 道加法题
 
@@ -53,9 +55,10 @@ mock 模式会启动 4 个独立 ACP 进程，将 16 个任务依次入队，并
 ```powershell
 $env:CODEX_ACP_ENTRY = 'C:\absolute\path\to\node_modules\@agentclientprotocol\codex-acp\dist\index.js'
 cargo run -p agentpools-acp --example batch_add --all-features -- --codex
+cargo run -p agentpools-acp --example batch_add --all-features -- --codex-shared
 ```
 
-真实模式要求每个会话选中 `gpt-6-luna`，并核对 16 次结果和对应的 MCP 调用记录；模型未被选中时立即报错。它会消耗真实模型额度。每次运行同样自动生成报告，写到新的 `target/agentpools-batch-add/codex-<时间戳>/` 目录。
+真实模式要求每个会话选中 `gpt-6-luna`，并核对 16 次结果和对应的 MCP 调用记录；模型未被选中时立即报错。它会消耗真实模型额度。两种真实模式每次运行都自动生成报告，分别写到新的 `target/agentpools-batch-add/codex-<时间戳>/` 和 `target/agentpools-batch-add/codex-shared-<时间戳>/` 目录。报告还记录整数格式达标数；示例退出码目前只检查 ACP 进程数、数值正确数和 MCP 调用数。
 
 若要比较 4 个 ACP 进程与 1 个共享 ACP 进程，在完成 `cargo build -p agentpools-acp --example batch_add --all-features` 后，从**已经运行 `codex login` 的同一个 Windows 用户会话**执行：
 

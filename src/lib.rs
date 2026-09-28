@@ -10,11 +10,9 @@ mod cancellation;
 mod error;
 mod lease;
 mod pool;
-mod task;
 
 pub use backend::{AgentBackend, AgentSession};
 pub use cancellation::CancellationToken;
-pub use error::{AcquireError, BuildError, SubmitError, TaskError};
+pub use error::{AcquireError, BuildError, TaskError};
 pub use lease::{LeaseHandle, SessionLease};
 pub use pool::{AgentPool, PoolConfig, PoolStatus, ShutdownMode, ShutdownReport};
-pub use task::{SubmitResult, TaskHandle, collect_ordered};

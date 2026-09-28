@@ -48,16 +48,12 @@ class BindingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         directory, log_path, options = fixture()
         pool = AgentPool(options)
         try:
-            first = pool.submit("first task")
-            second = pool.submit("second task")
-            self.assertIsInstance(first.id, str)
-            self.assertEqual(
-                await asyncio.gather(first.result(), second.result()),
-                [
-                    {"text": "mock:first task", "stopReason": "end_turn"},
-                    {"text": "mock:second task", "stopReason": "end_turn"},
-                ],
-            )
+            lease = await pool.acquire()
+            self.assertEqual(await lease.ask("first task"),
+                {"text": "mock:first task", "stopReason": "end_turn"})
+            self.assertEqual(await lease.ask("second task"),
+                {"text": "mock:second task", "stopReason": "end_turn"})
+            await lease.finish()
             report = await pool.close(drain=True)
             self.assertEqual(report, {"closed": True, "closeErrors": [], "panickedWorkers": 0})
             self.assertEqual(pool.status(), {"queued": 0, "active": 0, "closed": True})
@@ -78,13 +74,12 @@ class BindingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         directory, log_path, options = fixture("recover-on-feedback")
         pool = AgentPool(options)
         try:
-            task = pool.submit_retrying(
-                "initial",
-                max_attempts=2,
-                feedback_template="Attempt {attempt} failed: {error}. Please retry.",
-            )
-            response = await task.result()
+            lease = await pool.acquire()
+            with self.assertRaisesRegex(RuntimeError, "mock failure"):
+                await lease.ask("initial")
+            response = await lease.ask("Attempt 1 failed: mock failure. Please retry.")
             self.assertIn("mock failure", response["text"])
+            await lease.finish()
             await pool.close(drain=True)
 
             messages = [json.loads(line) for line in log_path.read_text().splitlines()]
@@ -105,7 +100,8 @@ class BindingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             lease = await pool.acquire()
             self.assertEqual(lease.agent_index, 0)
             self.assertEqual(await lease.ask("draft"), {"text": "mock:draft", "stopReason": "end_turn"})
-            queued = pool.submit("next task")
+            queued = asyncio.create_task(pool.acquire())
+            await asyncio.sleep(0.05)
             # The caller validates the draft here, outside any agent call.
             self.assertEqual(pool.status(), {"queued": 1, "active": 1, "closed": False})
             self.assertEqual(
@@ -115,10 +111,12 @@ class BindingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pool.status()["queued"], 1)
             await lease.finish()
             lease = None
+            next_lease = await queued
             self.assertEqual(
-                await queued.result(),
+                await next_lease.ask("next task"),
                 {"text": "mock:next task", "stopReason": "end_turn"},
             )
+            await next_lease.finish()
             await pool.close(drain=True)
 
             messages = [json.loads(line) for line in log_path.read_text().splitlines()]

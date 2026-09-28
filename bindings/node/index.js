@@ -39,27 +39,9 @@ function encodePrompt(prompt) {
     return JSON.stringify({ content: [{ type: 'text', text: prompt }] })
   }
   if (!prompt || !Array.isArray(prompt.content)) {
-    throw new TypeError('prompt must be a string or an ACP prompt with a content array')
+    throw new TypeError('prompt must be a string or a prompt with a content array')
   }
   return JSON.stringify(prompt)
-}
-
-class Task {
-  constructor(nativeTask) {
-    this._native = nativeTask
-  }
-
-  get id() {
-    return this._native.id
-  }
-
-  cancel() {
-    this._native.cancel()
-  }
-
-  async result() {
-    return JSON.parse(await this._native.result())
-  }
 }
 
 class SessionLease {
@@ -95,10 +77,6 @@ class AgentPool {
     this._native = native.createPool(JSON.stringify(options))
   }
 
-  submit(prompt, agentIndex) {
-    return new Task(this._native.submit(encodePrompt(prompt), agentIndex))
-  }
-
   async acquire(agentIndex) {
     const nativeLease = this._native.requestLease(agentIndex)
     try {
@@ -110,23 +88,6 @@ class AgentPool {
     }
   }
 
-  submitRetrying(prompt, { maxAttempts, feedbackTemplate, agentIndex } = {}) {
-    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
-      throw new TypeError('maxAttempts must be a positive integer')
-    }
-    if (typeof feedbackTemplate !== 'string' || feedbackTemplate.length === 0) {
-      throw new TypeError('feedbackTemplate must be a non-empty string')
-    }
-    return new Task(
-      this._native.submitRetrying(
-        encodePrompt(prompt),
-        maxAttempts,
-        feedbackTemplate,
-        agentIndex,
-      ),
-    )
-  }
-
   status() {
     return JSON.parse(this._native.statusJson())
   }
@@ -136,4 +97,4 @@ class AgentPool {
   }
 }
 
-module.exports = { AgentPool, SessionLease, Task }
+module.exports = { AgentPool, SessionLease }

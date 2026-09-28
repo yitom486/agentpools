@@ -22,14 +22,18 @@ export interface AcpPoolOptions {
   maxQueued?: number
 }
 
-export interface AcpPrompt {
+export interface AgentPrompt {
   content: unknown[]
 }
 
-export interface AcpResponse {
+export interface AcpPrompt extends AgentPrompt {}
+
+export interface AgentResponse {
   text: string
   stopReason: string
 }
+
+export interface AcpResponse extends AgentResponse {}
 
 export interface PoolStatus {
   queued: number
@@ -43,30 +47,52 @@ export interface ShutdownReport {
   panickedWorkers: number
 }
 
-export class Task {
-  readonly id: string
-  cancel(): void
-  result(): Promise<AcpResponse>
-}
-
 export class SessionLease {
   readonly agentIndex: number
-  ask(prompt: string | AcpPrompt): Promise<AcpResponse>
+  ask(prompt: string | AgentPrompt): Promise<AgentResponse>
   finish(): Promise<void>
 }
 
 export class AgentPool {
-  constructor(options: AcpPoolOptions)
+  constructor(options: AcpPoolOptions | MultiRuntimePoolOptions)
   acquire(agentIndex?: number): Promise<SessionLease>
-  submit(prompt: string | AcpPrompt, agentIndex?: number): Task
-  submitRetrying(
-    prompt: string | AcpPrompt,
-    options: {
-      maxAttempts: number
-      feedbackTemplate: string
-      agentIndex?: number
-    },
-  ): Task
   status(): PoolStatus
   close(options?: { drain?: boolean }): Promise<ShutdownReport>
+}
+
+export interface NativeTimeouts {
+  handshakeMs?: number
+  promptMs?: number
+}
+
+export interface CodexAppServerAgentOptions {
+  runtime: 'codexAppServer'
+  program: string
+  args?: string[]
+  env?: Record<string, string>
+  cwd: string
+  model?: string | null
+  timeouts?: NativeTimeouts
+  inheritStderr?: boolean
+}
+
+export interface PiRpcAgentOptions {
+  runtime: 'piRpc'
+  program: string
+  args?: string[]
+  env?: Record<string, string>
+  cwd: string
+  timeouts?: NativeTimeouts
+  inheritStderr?: boolean
+}
+
+export type RuntimeAgentOptions =
+  | ({ runtime: 'acp' } & AcpAgentOptions)
+  | CodexAppServerAgentOptions
+  | PiRpcAgentOptions
+
+export interface MultiRuntimePoolOptions {
+  apiVersion: 2
+  agents: RuntimeAgentOptions[]
+  maxQueued?: number
 }

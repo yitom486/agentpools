@@ -2,7 +2,7 @@
 
 This document defines the shared configuration and task value shapes for the
 Node.js and Python bindings. Both bindings call the same Rust
-`agentpools` scheduler and `agentpools-acp` adapter; they will not reimplement
+`agentpools` scheduler and `agentpools-runtime` adapter; they will not reimplement
 scheduling in JavaScript or Python.
 
 ## Scope and versioning
@@ -12,33 +12,26 @@ and one reusable ACP process/session. The config has an explicit `apiVersion`
 so bindings can reject unsupported contracts before spawning agents. Unknown
 fields are rejected to catch misspelled options.
 
+This section describes the compatible ACP API v1. The bindings call
+`agentpools-runtime::build_pool`, which also accepts tagged API v2 configs for ACP,
+Codex app-server, and Pi RPC. See the [multi-runtime usage guide](multi-runtime-usage.md).
+The Rust ACP adapter also has
+an opt-in `SharedAcpBackend` / `AcpPoolOptions::build_shared()` path, where
+multiple worker sessions share one ACP process. The bindings do not expose
+that path or a JSON switch for it in API v1. See the
+[execution-mode guide](execution-modes-and-reports.md).
+
 The bindings expose the scheduler lifecycle as native async APIs:
 
-- construct a pool from `AcpPoolOptions`;
-- submit an ACP prompt to any available agent, or target an agent index;
-- await the response and cancel a task;
-- acquire an exclusive session for caller-side validation and correction;
-- inspect aggregate queue/active/closed status;
-- drain or cancel queued work, then close the pool.
+- construct a pool from ACP API v1 or tagged runtime API v2 options;
+- acquire any worker or target an agent index;
+- call lease.ask(prompt), validate, and repeat while retaining that worker;
+- call lease.finish() or exit Python's async context to release it;
+- inspect status and close the pool.
 
-An explicit `submitRetrying` / `submit_retrying` call also accepts a
-`feedbackTemplate`; `{error}` and `{attempt}` are replaced before the text is
-prepended as the next ACP prompt block. `maxAttempts` / `max_attempts` counts
-the initial call as attempt one. Retry remains adapter-gated: only a
-recoverable error on a synchronized session reaches the same worker/session.
+The worker remains reserved while application code validates the response. A recoverable ACP error may be sent back as feedback in a later ask on the same session. An uncertain error closes the session; the lease keeps the worker and a later ask opens a fresh session. Node.js exposes the worker index as agentIndex, Python as agent_index.
 
-For validation after a successful response, use `acquire()` (optionally with
-an agent index), then call `lease.ask(prompt)` as often as needed. The lease
-holds its worker while application code validates the response, even when no
-agent call is active. `lease.finish()` releases it; Python also supports
-`async with await pool.acquire()`. Node and Python expose the selected worker
-as `agentIndex` and `agent_index`, respectively. A plain `submit` result does
-not reserve the worker after the result is delivered.
-
-ACP session setup is lazy: constructing the pool validates configuration and
-starts worker threads; an ACP process starts when its worker receives its first
-task. Node promises and Python `asyncio` calls must not block their event loop
-while waiting for Rust task handles.
+Session setup is lazy: creating a pool starts worker threads, and acquiring a worker opens its ACP session. Release all leases before a draining shutdown.
 
 ## Configuration shape
 
@@ -100,24 +93,11 @@ language-native exceptions with the original error message.
 
 ## Scheduler semantics bindings must preserve
 
-- One worker owns one session at a time; a submitted task and its retries keep
-  that worker until the task succeeds, is abandoned, or is cancelled.
-- A session lease reserves the worker across successful responses and caller
-  validation. Later queued work cannot use that worker until `finish()` or
-  the lease is dropped. Other workers continue independently.
-- Retry is opt-in. Only errors for which the adapter reports the session is
-  still synchronized may be retried on that same session.
-- A recoverable error during `lease.ask()` leaves the lease and session in
-  place. An uncertain error closes that session; the lease retains the worker,
-  and a later `ask()` opens a new session on it.
-- A normal failed prompt discards the uncertain session. The next task on that
-  worker opens a fresh ACP process/session.
-- MCP config is session-scoped. Use separate agent entries or pools when tool
-  sets differ; task submission does not infer tool compatibility.
-- Shutdown joins workers and closes sessions. ACP I/O timeouts bound that
-  operation; release all outstanding leases before closing the pool, because
-  shutdown waits for their workers. Dropping a pool cancels queued work and
-  waits for running calls.
+- A SessionLease owns one worker across all calls, validation, and feedback until finish or drop. Other workers continue independently.
+- Retry is a caller decision. The adapter allows original-session reuse only when the protocol remains synchronized.
+- An uncertain error closes the session; the lease stays on its worker, and the next ask opens a new session.
+- Queued leases are bounded and cancellable. Shutdown waits for active leases.
+- MCP configuration belongs to a session; use distinct agent entries or pools for distinct tool sets.
 
 The Rust source of these serialized types is `agentpools_acp::{AcpPoolOptions,
 AcpAgentOptions, AcpTimeoutOptions, AcpPrompt, AcpResponse}`. JSON serialization

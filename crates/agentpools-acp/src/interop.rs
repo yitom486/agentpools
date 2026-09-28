@@ -130,7 +130,7 @@ impl AcpPoolOptions {
 }
 
 impl AcpAgentOptions {
-    fn into_config(self, index: usize) -> Result<AcpConfig, AcpPoolBuildError> {
+    pub fn into_config(self, index: usize) -> Result<AcpConfig, AcpPoolBuildError> {
         if self.program.trim().is_empty() {
             return Err(AcpPoolBuildError::InvalidAgent {
                 index,

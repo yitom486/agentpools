@@ -24,8 +24,27 @@ impl std::error::Error for BuildError {
     }
 }
 
-/// A leased call failure. The session remains usable after an error only if
-/// its adapter confirms that the protocol is still synchronized.
+/// A rejected submission retains ownership of its request.
+#[derive(Debug)]
+pub enum SubmitError<Request> {
+    Closed(Request),
+    QueueFull(Request),
+    NoSuchAgent(Request),
+}
+
+impl<Request> fmt::Display for SubmitError<Request> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed(_) => write!(f, "agent pool is closed"),
+            Self::QueueFull(_) => write!(f, "agent pool queue is full"),
+            Self::NoSuchAgent(_) => write!(f, "agent index does not exist"),
+        }
+    }
+}
+
+/// A task failure. Ordinary submitted tasks close their session after a failed
+/// `run`; a leased session remains usable only if its adapter confirms that
+/// the failed call left the protocol synchronized.
 #[derive(Debug)]
 pub enum TaskError<Error> {
     Open(Error),

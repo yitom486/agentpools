@@ -39,10 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_queued: 1,
         },
     )?;
-    let response = pool
-        .submit(AcpPrompt::text(prompt))
-        .map_err(|_| "could not submit prompt")?
-        .wait()?;
+    let mut lease = pool.acquire()?;
+    let response = lease.ask(AcpPrompt::text(prompt))?;
+    lease.finish()?;
     println!("{}", response.text);
     let report = pool.shutdown(ShutdownMode::Drain);
     if report.panicked_workers != 0 || !report.close_errors.is_empty() {

@@ -22,7 +22,7 @@ name = "agentpools-node"
 version = "0.1.0"
 dependencies = [
  "agentpools",
- "agentpools-acp",
+ "agentpools-runtime",
  "napi",
  "napi-build",
  "napi-derive",
@@ -34,8 +34,18 @@ name = "agentpools-python"
 version = "0.1.0"
 dependencies = [
  "agentpools",
- "agentpools-acp",
+ "agentpools-runtime",
  "pyo3",
+ "serde_json",
+]
+
+[[package]]
+name = "agentpools-runtime"
+version = "0.1.0"
+dependencies = [
+ "agentpools",
+ "agentpools-acp",
+ "serde",
  "serde_json",
 ]
 

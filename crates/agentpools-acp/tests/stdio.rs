@@ -2,13 +2,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentPool, PoolConfig, ShutdownMode, TaskError};
+use agentpools::{AcquireError, AgentPool, CancellationToken, PoolConfig, ShutdownMode, TaskError};
 use agentpools_acp::{
     ACP_POOL_API_VERSION, AcpAgentOptions, AcpBackend, AcpConfig, AcpError, AcpPoolOptions,
     AcpPrompt, AcpTimeoutOptions, HostRequestHandler, SharedAcpBackend,
@@ -52,6 +51,16 @@ fn pool(config: AcpConfig) -> AgentPool<AcpBackend> {
     .unwrap()
 }
 
+fn ask_once(
+    pool: &AgentPool<AcpBackend>,
+    prompt: AcpPrompt,
+) -> Result<agentpools_acp::AcpResponse, TaskError<AcpError>> {
+    let mut lease = pool.acquire().expect("reserve worker");
+    let result = lease.ask(prompt);
+    lease.finish().expect("release worker");
+    result
+}
+
 fn log(path: &PathBuf) -> Vec<Value> {
     let content = fs::read_to_string(path).unwrap();
     // Polling tests may read while the mock process is still appending a line.
@@ -83,8 +92,8 @@ fn real_stdio_roundtrip_reuses_session_and_forwards_mcp_config() {
     ];
     config.mcp_servers = mcp.clone();
     let mut pool = pool(config);
-    let first = pool.submit(AcpPrompt::text("one")).unwrap().wait().unwrap();
-    let second = pool.submit(AcpPrompt::text("two")).unwrap().wait().unwrap();
+    let first = ask_once(&pool, AcpPrompt::text("one")).unwrap();
+    let second = ask_once(&pool, AcpPrompt::text("two")).unwrap();
     assert_eq!(first.text, "mock:one");
     assert_eq!(second.text, "mock:two");
     assert_eq!(first.stop_reason, "end_turn");
@@ -121,11 +130,16 @@ fn shared_process_routes_concurrent_sessions_and_uses_global_request_ids() {
     let backend = SharedAcpBackend::new();
     let mut pool =
         AgentPool::with_agents(vec![(backend.clone(), first), (backend, second)], 4).unwrap();
-    let slow = pool.submit_to(0, AcpPrompt::text("slow")).unwrap();
-    let fast = pool.submit_to(1, AcpPrompt::text("fast")).unwrap();
-
-    let fast = fast.wait().unwrap();
-    let slow = slow.wait().unwrap();
+    let mut slow_lease = pool.acquire_to(0).unwrap();
+    let mut fast_lease = pool.acquire_to(1).unwrap();
+    let slow_call = std::thread::spawn(move || {
+        let result = slow_lease.ask(AcpPrompt::text("slow")).unwrap();
+        slow_lease.finish().unwrap();
+        result
+    });
+    let fast = fast_lease.ask(AcpPrompt::text("fast")).unwrap();
+    fast_lease.finish().unwrap();
+    let slow = slow_call.join().unwrap();
     assert!(
         fast.text.ends_with(":fast"),
         "unexpected response: {fast:?}"
@@ -205,11 +219,7 @@ fn language_config_builds_pool_and_forwards_mcp_servers_to_acp() {
         max_queued: 4,
     };
     let mut pool = options.build().unwrap();
-    let response = pool
-        .submit(AcpPrompt::text("hello from the language API"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    let response = ask_once(&pool, AcpPrompt::text("hello from the language API")).unwrap();
     assert_eq!(response.text, "mock:hello from the language API");
     pool.shutdown(ShutdownMode::Drain);
 
@@ -236,11 +246,7 @@ fn agent_permission_request_reaches_caller_handler() {
     let (mut config, path) = test_config("permission");
     config.host_handler = Some(Arc::new(PermissionHandler));
     let mut pool = pool(config);
-    let response = pool
-        .submit(AcpPrompt::text("use tool"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    let response = ask_once(&pool, AcpPrompt::text("use tool")).unwrap();
     assert_eq!(response.text, "mock:use tool");
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);
@@ -256,11 +262,7 @@ fn agent_permission_request_reaches_caller_handler() {
 fn permission_is_cancelled_when_caller_did_not_supply_handler() {
     let (config, path) = test_config("permission");
     let mut pool = pool(config);
-    let response = pool
-        .submit(AcpPrompt::text("use tool"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    let response = ask_once(&pool, AcpPrompt::text("use tool")).unwrap();
     assert_eq!(response.text, "mock:use tool");
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);
@@ -278,11 +280,7 @@ fn explicit_authentication_happens_before_session_creation() {
     config.auth_method = Some("api-key".into());
     let mut pool = pool(config);
     assert_eq!(
-        pool.submit(AcpPrompt::text("hello"))
-            .unwrap()
-            .wait()
-            .unwrap()
-            .text,
+        ask_once(&pool, AcpPrompt::text("hello")).unwrap().text,
         "mock:hello"
     );
     pool.shutdown(ShutdownMode::Drain);
@@ -304,11 +302,7 @@ fn requested_model_is_set_and_verified_before_prompt() {
     config.model = Some("gpt-6-luna".into());
     let mut pool = pool(config);
     assert_eq!(
-        pool.submit(AcpPrompt::text("hello"))
-            .unwrap()
-            .wait()
-            .unwrap()
-            .text,
+        ask_once(&pool, AcpPrompt::text("hello")).unwrap().text,
         "mock:hello"
     );
     pool.shutdown(ShutdownMode::Drain);
@@ -341,8 +335,8 @@ fn model_mismatch_rejects_session_before_prompt() {
     config.model = Some("gpt-6-luna".into());
     let mut pool = pool(config);
     assert!(matches!(
-        pool.submit(AcpPrompt::text("hello")).unwrap().wait(),
-        Err(TaskError::Open(AcpError::Protocol(_)))
+        pool.acquire(),
+        Err(AcquireError::Open(AcpError::Protocol(_)))
     ));
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);
@@ -355,10 +349,7 @@ fn model_mismatch_rejects_session_before_prompt() {
 fn close_method_is_not_sent_when_agent_did_not_advertise_it() {
     let (config, path) = test_config("no-close");
     let mut pool = pool(config);
-    pool.submit(AcpPrompt::text("hello"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    ask_once(&pool, AcpPrompt::text("hello")).unwrap();
     pool.shutdown(ShutdownMode::Drain);
     assert_eq!(count_method(&log(&path), "session/close"), 0);
     let _ = fs::remove_file(path);
@@ -368,7 +359,14 @@ fn close_method_is_not_sent_when_agent_did_not_advertise_it() {
 fn cancellation_sends_acp_cancel_and_closes_session() {
     let (config, path) = test_config("cancel");
     let mut pool = pool(config);
-    let handle = pool.submit(AcpPrompt::text("wait")).unwrap();
+    let mut lease = pool.acquire().unwrap();
+    let token = CancellationToken::default();
+    let cancellation = token.clone();
+    let call = std::thread::spawn(move || {
+        let result = lease.ask_with_cancellation(AcpPrompt::text("wait"), cancellation);
+        lease.finish().unwrap();
+        result
+    });
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if path.exists() && count_method(&log(&path), "session/prompt") == 1 {
@@ -377,9 +375,9 @@ fn cancellation_sends_acp_cancel_and_closes_session() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(count_method(&log(&path), "session/prompt"), 1);
-    handle.cancel();
+    token.cancel();
     assert!(matches!(
-        handle.wait(),
+        call.join().unwrap(),
         Err(TaskError::Run {
             source: AcpError::Cancelled,
             ..
@@ -397,8 +395,8 @@ fn incompatible_protocol_version_fails_before_session_creation() {
     let (config, path) = test_config("bad-version");
     let mut pool = pool(config);
     assert!(matches!(
-        pool.submit(AcpPrompt::text("hello")).unwrap().wait(),
-        Err(TaskError::Open(AcpError::Protocol(_)))
+        pool.acquire(),
+        Err(AcquireError::Open(AcpError::Protocol(_)))
     ));
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);
@@ -408,12 +406,12 @@ fn incompatible_protocol_version_fails_before_session_creation() {
 }
 
 #[test]
-fn agent_error_discards_session_before_next_task() {
+fn recoverable_agent_error_keeps_session_for_next_lease() {
     let (config, path) = test_config("prompt-error");
     let mut pool = pool(config);
     for _ in 0..2 {
         assert!(matches!(
-            pool.submit(AcpPrompt::text("fail")).unwrap().wait(),
+            ask_once(&pool, AcpPrompt::text("fail")),
             Err(TaskError::Run {
                 source: AcpError::Remote { .. },
                 ..
@@ -422,38 +420,88 @@ fn agent_error_discards_session_before_next_task() {
     }
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);
-    assert_eq!(count_method(&messages, "initialize"), 2);
-    assert_eq!(count_method(&messages, "session/new"), 2);
-    assert_eq!(count_method(&messages, "session/close"), 2);
+    assert_eq!(count_method(&messages, "initialize"), 1);
+    assert_eq!(count_method(&messages, "session/new"), 1);
+    assert_eq!(count_method(&messages, "session/close"), 1);
     let _ = fs::remove_file(path);
 }
 
 #[test]
-fn remote_error_feedback_retries_in_the_same_acp_session() {
+fn retry_keeps_the_same_acp_session_and_blocks_queued_work_until_release() {
     let (config, path) = test_config("recover-on-feedback");
     let mut pool = pool(config);
-    let response = pool
-        .submit_retrying(
-            AcpPrompt::text("initial"),
-            NonZeroUsize::new(2).unwrap(),
-            |error, attempt| {
-                assert_eq!(attempt, 1);
-                assert!(matches!(error, AcpError::Remote { .. }));
-                Some(AcpPrompt::text(format!(
-                    "The previous attempt failed: {error}. Please retry."
-                )))
-            },
-        )
-        .unwrap()
-        .wait()
+    let mut lease = pool.acquire_to(0).unwrap();
+    let error = lease.ask(AcpPrompt::text("initial")).unwrap_err();
+    assert!(matches!(
+        error,
+        TaskError::Run {
+            source: AcpError::Remote { .. },
+            close: None
+        }
+    ));
+
+    // The first call has failed, but the caller still owns this worker while
+    // deciding how to respond. A queued lease must not become ready yet.
+    let queued = pool.request_lease_to(0).unwrap();
+    let (ready, acquired) = mpsc::channel();
+    let queued_call = std::thread::spawn(move || {
+        let mut next = queued.wait().unwrap();
+        ready.send(()).unwrap();
+        let response = next.ask(AcpPrompt::text("queued")).unwrap();
+        next.finish().unwrap();
+        response
+    });
+    assert_eq!(pool.status().active, 1);
+    assert_eq!(pool.status().queued, 1);
+    let acquired_during_feedback = acquired.recv_timeout(Duration::from_millis(150)).is_ok();
+
+    let response = lease
+        .ask(AcpPrompt::text(format!(
+            "The previous attempt failed: {error}. Please retry."
+        )))
         .unwrap();
     assert!(response.text.contains("mock failure"));
-    pool.shutdown(ShutdownMode::Drain);
+    assert_eq!(pool.status().active, 1);
+    assert_eq!(pool.status().queued, 1);
+    let acquired_during_retry = acquired.recv_timeout(Duration::from_millis(150)).is_ok();
+    let before_release = log(&path);
+    assert_eq!(count_method(&before_release, "session/prompt"), 2);
+
+    lease.finish().unwrap();
+    assert!(acquired.recv_timeout(Duration::from_secs(2)).is_ok());
+    let queued_response = queued_call.join().unwrap();
+    assert_eq!(queued_response.text, "mock:queued");
+    let report = pool.shutdown(ShutdownMode::Drain);
+    assert_eq!(report.panicked_workers, 0);
+    assert!(report.close_errors.is_empty());
+    assert!(
+        !acquired_during_feedback,
+        "queued lease acquired during feedback"
+    );
+    assert!(!acquired_during_retry, "queued lease acquired during retry");
+
     let messages = log(&path);
     assert_eq!(count_method(&messages, "initialize"), 1);
     assert_eq!(count_method(&messages, "session/new"), 1);
-    assert_eq!(count_method(&messages, "session/prompt"), 2);
+    assert_eq!(count_method(&messages, "session/prompt"), 3);
     assert_eq!(count_method(&messages, "session/close"), 1);
+    let prompts = messages
+        .iter()
+        .filter(|message| message["method"] == "session/prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "initial");
+    assert!(
+        prompts[1]["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mock failure")
+    );
+    assert_eq!(prompts[2]["params"]["prompt"][0]["text"], "queued");
+    let session_ids = prompts
+        .iter()
+        .map(|message| message["params"]["sessionId"].as_str().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(session_ids, HashSet::from(["mock-session"]));
     let _ = fs::remove_file(path);
 }
 
@@ -468,17 +516,9 @@ fn injected_official_mcp_add_tool_is_called_through_mock_acp_agent() {
         "env": []
     })];
     let mut pool = pool(config);
-    let response = pool
-        .submit(AcpPrompt::text("add 2 and 3"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    let response = ask_once(&pool, AcpPrompt::text("add 2 and 3")).unwrap();
     assert_eq!(response.text, "mock:5");
-    let response = pool
-        .submit(AcpPrompt::text("add 8 and 13"))
-        .unwrap()
-        .wait()
-        .unwrap();
+    let response = ask_once(&pool, AcpPrompt::text("add 8 and 13")).unwrap();
     assert_eq!(response.text, "mock:21");
     pool.shutdown(ShutdownMode::Drain);
     let messages = log(&path);

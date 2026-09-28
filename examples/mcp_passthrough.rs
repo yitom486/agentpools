@@ -54,8 +54,14 @@ fn main() {
         PoolConfig::default(),
     )
     .expect("start pool");
-    let handle = pool.submit("summarize chapter 1".into()).expect("submit");
-    println!("{}", handle.wait().expect("agent response"));
+    let mut lease = pool.acquire().expect("reserve worker");
+    println!(
+        "{}",
+        lease
+            .ask("summarize chapter 1".into())
+            .expect("agent response")
+    );
+    lease.finish().expect("release worker");
     let report = pool.shutdown(ShutdownMode::Drain);
     assert!(report.close_errors.is_empty());
 }

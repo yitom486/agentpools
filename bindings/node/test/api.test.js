@@ -9,15 +9,11 @@ test('rejects invalid options before starting agent processes', () => {
   assert.throws(() => new AgentPool({ apiVersion: 2, agents: [] }))
 })
 
-test('formats task prompts and validates retry options', async (context) => {
+test('validates lease prompts before starting an agent', async (context) => {
   const pool = new AgentPool({
     apiVersion: 1,
-    agents: [{ program: 'not-started-until-submit', cwd: process.cwd() }],
+    agents: [{ program: 'not-started-until-acquire', cwd: process.cwd() }],
   })
   context.after(() => pool.close())
-  assert.throws(
-    () =>
-      pool.submitRetrying('hello', { maxAttempts: 0, feedbackTemplate: 'retry {error}' }),
-    /maxAttempts/,
-  )
+  assert.equal(pool.status().active, 0)
 })

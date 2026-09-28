@@ -65,7 +65,11 @@ impl Mode {
     }
 
     fn expected_processes(self) -> usize {
-        if matches!(self, Self::CodexShared) { 1 } else { 4 }
+        if matches!(self, Self::CodexShared) {
+            1
+        } else {
+            4
+        }
     }
 }
 
@@ -419,7 +423,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     let mut pool = AgentPool::with_agents(agents, PROBLEMS.len())?;
-    let mut handles = Vec::new();
+    let mut pending = Vec::new();
     for (index, &(a, b)) in PROBLEMS.iter().enumerate() {
         let task = AdditionTask {
             id: index + 1,
@@ -428,17 +432,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             submitted_ms: started.elapsed().as_millis(),
         };
         let handle = if index < 4 {
-            pool.submit_to(index, task)
+            pool.request_lease_to(index)
         } else {
-            pool.submit(task)
+            pool.request_lease()
         }
-        .map_err(|error| format!("cannot submit task {}: {error}", index + 1))?;
-        handles.push(handle);
+        .map_err(|error| format!("cannot reserve worker for task {}: {error}", index + 1))?;
+        pending.push((index + 1, task, handle));
     }
+    let calls = pending
+        .into_iter()
+        .map(|(id, task, handle)| {
+            let thread = std::thread::spawn(move || -> Result<(), String> {
+                let mut lease = handle.wait().map_err(|error| error.to_string())?;
+                let result = lease.ask(task).map_err(|error| error.to_string());
+                lease.finish().map_err(|error| error.to_string())?;
+                result.map(|_| ())
+            });
+            (id, thread)
+        })
+        .collect::<Vec<_>>();
     let mut failures = Vec::new();
-    for (index, handle) in handles.into_iter().enumerate() {
-        if let Err(error) = handle.wait() {
-            failures.push((index + 1, error.to_string()));
+    for (id, call) in calls {
+        match call.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push((id, error)),
+            Err(_) => failures.push((id, "task thread panicked".to_string())),
         }
     }
     let shutdown = pool.shutdown(ShutdownMode::Drain);
@@ -482,11 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .len();
     let report = Report {
         mode: mode.label(),
-        model: if mode.is_codex() {
-            Some(MODEL)
-        } else {
-            None
-        },
+        model: if mode.is_codex() { Some(MODEL) } else { None },
         agent_processes,
         total_ms,
         correct: records.iter().filter(|record| record.correct).count(),

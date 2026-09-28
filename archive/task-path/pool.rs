@@ -1,10 +1,10 @@
 use crate::lease::{LeaseCommand, LeaseReady};
 use crate::{
     AcquireError, AgentBackend, AgentSession, BuildError, CancellationToken, LeaseHandle,
-    SessionLease, TaskError,
+    SessionLease, SubmitError, SubmitResult, TaskError, TaskHandle,
 };
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -46,14 +46,44 @@ pub struct PoolStatus {
     pub closed: bool,
 }
 
+struct Job<B: AgentBackend> {
+    request: B::Request,
+    retry: Option<RetryPlan<B>>,
+    target: Option<usize>,
+    cancellation: CancellationToken,
+    result: mpsc::Sender<Result<B::Response, TaskError<B::Error>>>,
+}
+
 struct LeaseRequest<B: AgentBackend> {
     target: Option<usize>,
     cancellation: CancellationToken,
     result: mpsc::Sender<Result<LeaseReady<B>, AcquireError<B::Error>>>,
 }
 
+enum Work<B: AgentBackend> {
+    Task(Job<B>),
+    Lease(LeaseRequest<B>),
+}
+
+impl<B: AgentBackend> Work<B> {
+    fn target(&self) -> Option<usize> {
+        match self {
+            Self::Task(job) => job.target,
+            Self::Lease(request) => request.target,
+        }
+    }
+}
+
+struct RetryPlan<B: AgentBackend> {
+    max_attempts: std::num::NonZeroUsize,
+    next_request: Box<NextRequest<B>>,
+}
+
+type NextRequest<B> =
+    dyn FnMut(&<B as AgentBackend>::Error, usize) -> Option<<B as AgentBackend>::Request> + Send;
+
 struct Queue<B: AgentBackend> {
-    jobs: VecDeque<LeaseRequest<B>>,
+    jobs: VecDeque<Work<B>>,
     closed: bool,
 }
 
@@ -71,10 +101,11 @@ struct WorkerAgent<B: AgentBackend> {
 }
 
 /// A persistent, bounded pool. Sessions start lazily, one per busy worker,
-/// and are reused for later leases assigned to that worker.
+/// and are reused for later tasks assigned to that worker.
 pub struct AgentPool<B: AgentBackend> {
     shared: Arc<Shared<B>>,
     workers: Vec<JoinHandle<Option<B::Error>>>,
+    next_id: AtomicU64,
 }
 
 impl<B: AgentBackend> AgentPool<B> {
@@ -128,6 +159,7 @@ impl<B: AgentBackend> AgentPool<B> {
         let mut pool = Self {
             shared,
             workers: Vec::with_capacity(agents.len()),
+            next_id: AtomicU64::new(1),
         };
         for (index, agent) in agents.into_iter().enumerate() {
             let shared = Arc::clone(&pool.shared);
@@ -143,6 +175,18 @@ impl<B: AgentBackend> AgentPool<B> {
             }
         }
         Ok(pool)
+    }
+
+    /// Submit a request without blocking. A full queue returns the original
+    /// request so the caller can apply its own backpressure policy.
+    pub fn submit(&self, request: B::Request) -> SubmitResult<B> {
+        self.submit_routed(None, request, None)
+    }
+
+    /// Submit to a specific zero-based worker index from `with_agents`.
+    /// Use this when a task needs that Agent's profile or tool set.
+    pub fn submit_to(&self, agent_index: usize, request: B::Request) -> SubmitResult<B> {
+        self.submit_routed(Some(agent_index), request, None)
     }
 
     /// Block until an idle worker has opened its session and reserve it until
@@ -190,14 +234,88 @@ impl<B: AgentBackend> AgentPool<B> {
         }
         let cancellation = CancellationToken::default();
         let (sender, result) = mpsc::channel();
-        queue.jobs.push_back(LeaseRequest {
+        queue.jobs.push_back(Work::Lease(LeaseRequest {
             target,
             cancellation: cancellation.clone(),
             result: sender,
-        });
+        }));
         self.shared.ready.notify_all();
         Ok(LeaseHandle {
             cancellation: Some(cancellation),
+            result,
+        })
+    }
+
+    /// Keep one worker and its session for the whole task, including recoverable
+    /// failures and caller-directed retries. `next_request` receives the error
+    /// and the failed attempt number, so it can send feedback to the same Agent.
+    /// Returning `None` ends the task. At most `max_attempts` calls are made.
+    /// The caller must only retry operations whose side effects are acceptable.
+    pub fn submit_retrying(
+        &self,
+        request: B::Request,
+        max_attempts: std::num::NonZeroUsize,
+        next_request: impl FnMut(&B::Error, usize) -> Option<B::Request> + Send + 'static,
+    ) -> SubmitResult<B> {
+        self.submit_routed(
+            None,
+            request,
+            Some(RetryPlan {
+                max_attempts,
+                next_request: Box::new(next_request),
+            }),
+        )
+    }
+
+    /// Like [`Self::submit_retrying`], but reserves one chosen worker.
+    pub fn submit_retrying_to(
+        &self,
+        agent_index: usize,
+        request: B::Request,
+        max_attempts: std::num::NonZeroUsize,
+        next_request: impl FnMut(&B::Error, usize) -> Option<B::Request> + Send + 'static,
+    ) -> SubmitResult<B> {
+        self.submit_routed(
+            Some(agent_index),
+            request,
+            Some(RetryPlan {
+                max_attempts,
+                next_request: Box::new(next_request),
+            }),
+        )
+    }
+
+    fn submit_routed(
+        &self,
+        target: Option<usize>,
+        request: B::Request,
+        retry: Option<RetryPlan<B>>,
+    ) -> SubmitResult<B> {
+        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.closed {
+            return Err(SubmitError::Closed(request));
+        }
+        if target.is_some_and(|index| index >= self.shared.agent_count) {
+            return Err(SubmitError::NoSuchAgent(request));
+        }
+        if queue.jobs.len() >= self.shared.max_queued {
+            return Err(SubmitError::QueueFull(request));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::default();
+        let (sender, result) = mpsc::channel();
+        queue.jobs.push_back(Work::Task(Job {
+            request,
+            retry,
+            target,
+            cancellation: cancellation.clone(),
+            result: sender,
+        }));
+        // Targeted tasks must wake their chosen worker, not an idle sibling.
+        self.shared.ready.notify_all();
+        Ok(TaskHandle {
+            id,
+            cancellation,
             result,
         })
     }
@@ -211,7 +329,7 @@ impl<B: AgentBackend> AgentPool<B> {
         }
     }
 
-    /// Stop accepting leases, then join workers and close their sessions.
+    /// Stop accepting tasks, then join workers and close their sessions.
     /// Active leases must be finished or dropped before this call can return.
     /// Running calls must finish cooperatively or reach their adapter timeout.
     pub fn shutdown(&mut self, mode: ShutdownMode) -> ShutdownReport<B::Error> {
@@ -219,9 +337,17 @@ impl<B: AgentBackend> AgentPool<B> {
             let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.closed = true;
             if mode == ShutdownMode::CancelPending {
-                for request in queue.jobs.drain(..) {
-                    request.cancellation.cancel();
-                    let _ = request.result.send(Err(AcquireError::Cancelled));
+                for work in queue.jobs.drain(..) {
+                    match work {
+                        Work::Task(job) => {
+                            job.cancellation.cancel();
+                            let _ = job.result.send(Err(TaskError::Cancelled));
+                        }
+                        Work::Lease(request) => {
+                            request.cancellation.cancel();
+                            let _ = request.result.send(Err(AcquireError::Cancelled));
+                        }
+                    }
                 }
             }
             self.shared.ready.notify_all();
@@ -260,7 +386,7 @@ fn worker<B: AgentBackend>(
                 let eligible = queue
                     .jobs
                     .iter()
-                    .position(|request| request.target.is_none_or(|target| target == index));
+                    .position(|work| work.target().is_none_or(|target| target == index));
                 if let Some(work) = eligible.and_then(|position| queue.jobs.remove(position)) {
                     shared.active.fetch_add(1, Ordering::AcqRel);
                     break Some(work);
@@ -272,13 +398,74 @@ fn worker<B: AgentBackend>(
             }
         };
         let Some(work) = work else { break };
-        let release_ack = run_lease(&agent, &mut session, index, work);
+        let release_ack = match work {
+            Work::Task(job) => {
+                run_task(&agent, &mut session, job);
+                None
+            }
+            Work::Lease(request) => run_lease(&agent, &mut session, index, request),
+        };
         shared.active.fetch_sub(1, Ordering::AcqRel);
         if let Some(ack) = release_ack {
             let _ = ack.send(());
         }
     }
     session.and_then(|mut session| session.close().err())
+}
+
+fn run_task<B: AgentBackend>(
+    agent: &WorkerAgent<B>,
+    session: &mut Option<B::Session>,
+    mut job: Job<B>,
+) {
+    if job.cancellation.is_cancelled() {
+        let _ = job.result.send(Err(TaskError::Cancelled));
+        return;
+    }
+    if session.is_none() {
+        match agent.backend.open(&agent.session_config) {
+            Ok(opened) => *session = Some(opened),
+            Err(error) => {
+                let _ = job.result.send(Err(TaskError::Open(error)));
+                return;
+            }
+        }
+    }
+    let mut request = Some(job.request);
+    let mut attempt = 1;
+    let outcome = loop {
+        if job.cancellation.is_cancelled() {
+            break Err(TaskError::Cancelled);
+        }
+        let result = session.as_mut().expect("session just opened").run(
+            request.take().expect("request for attempt"),
+            &job.cancellation,
+        );
+        match result {
+            Ok(_response) if job.cancellation.is_cancelled() => {
+                break Err(TaskError::Cancelled);
+            }
+            Ok(response) => break Ok(response),
+            Err(source) => {
+                if !job.cancellation.is_cancelled()
+                    && let Some(retry) = job.retry.as_mut()
+                    && attempt < retry.max_attempts.get()
+                    && session
+                        .as_ref()
+                        .expect("session just ran")
+                        .can_retry_after(&source)
+                    && let Some(next) = (retry.next_request)(&source, attempt)
+                {
+                    request = Some(next);
+                    attempt += 1;
+                    continue;
+                }
+                let close = session.take().and_then(|mut session| session.close().err());
+                break Err(TaskError::Run { source, close });
+            }
+        }
+    };
+    let _ = job.result.send(outcome);
 }
 
 fn run_lease<B: AgentBackend>(

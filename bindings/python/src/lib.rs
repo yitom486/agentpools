@@ -1,18 +1,14 @@
-use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
-use agentpools::{
-    AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode, TaskHandle,
-};
-use agentpools_acp::{AcpBackend, AcpError, AcpPoolOptions, AcpPrompt, AcpResponse};
+use agentpools::{AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode};
+use agentpools_runtime::{RuntimeBackend, RuntimePrompt, build_pool};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde_json::json;
 
-type Pool = AgentPool<AcpBackend>;
-type Handle = TaskHandle<AcpResponse, AcpError>;
-type AcpLeaseHandle = LeaseHandle<AcpBackend>;
-type AcpLease = SessionLease<AcpBackend>;
+type Pool = AgentPool<RuntimeBackend>;
+type RuntimeLeaseHandle = LeaseHandle<RuntimeBackend>;
+type RuntimeLease = SessionLease<RuntimeBackend>;
 
 #[pyclass(name = "NativeAgentPool")]
 struct PyAgentPool {
@@ -23,30 +19,12 @@ struct PyAgentPool {
 impl PyAgentPool {
     #[new]
     fn new(config_json: &str) -> PyResult<Self> {
-        let options = serde_json::from_str::<AcpPoolOptions>(config_json).map_err(|error| {
+        let pool = build_pool(config_json).map_err(|error| {
             PyValueError::new_err(format!("invalid pool configuration: {error}"))
         })?;
-        let pool = options
-            .build()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self {
             pool: Mutex::new(Some(pool)),
         })
-    }
-
-    fn submit(&self, prompt_json: &str, agent_index: Option<u32>) -> PyResult<PyTask> {
-        let prompt = parse_prompt(prompt_json)?;
-        let pool = self.pool.lock().unwrap_or_else(|error| error.into_inner());
-        let pool = pool
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("agent pool is closed"))?;
-        let handle = if let Some(index) = agent_index {
-            pool.submit_to(index as usize, prompt)
-        } else {
-            pool.submit(prompt)
-        }
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        Ok(PyTask::new(handle))
     }
 
     fn request_lease(&self, agent_index: Option<u32>) -> PyResult<PyLeaseRequest> {
@@ -64,35 +42,6 @@ impl PyAgentPool {
             cancellation: handle.cancellation_token(),
             handle: Mutex::new(Some(handle)),
         })
-    }
-
-    fn submit_retrying(
-        &self,
-        prompt_json: &str,
-        max_attempts: u32,
-        feedback_template: String,
-        agent_index: Option<u32>,
-    ) -> PyResult<PyTask> {
-        let prompt = parse_prompt(prompt_json)?;
-        let attempts = NonZeroUsize::new(max_attempts as usize)
-            .ok_or_else(|| PyValueError::new_err("max_attempts must be greater than zero"))?;
-        let retry_base = prompt.clone();
-        let retry = move |error: &AcpError, attempt: usize| {
-            let feedback = render_feedback(&feedback_template, error, attempt);
-            Some(retry_base.with_retry_feedback(feedback))
-        };
-
-        let pool = self.pool.lock().unwrap_or_else(|error| error.into_inner());
-        let pool = pool
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("agent pool is closed"))?;
-        let handle = if let Some(index) = agent_index {
-            pool.submit_retrying_to(index as usize, prompt, attempts, retry)
-        } else {
-            pool.submit_retrying(prompt, attempts, retry)
-        }
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        Ok(PyTask::new(handle))
     }
 
     fn status_json(&self) -> PyResult<String> {
@@ -134,29 +83,10 @@ impl Drop for PyAgentPool {
     }
 }
 
-#[pyclass(name = "NativeTask")]
-struct PyTask {
-    id: String,
-    cancellation: CancellationToken,
-    handle: Mutex<Option<Handle>>,
-}
-
-impl PyTask {
-    fn new(handle: Handle) -> Self {
-        let id = handle.id().to_string();
-        let cancellation = handle.cancellation_token();
-        Self {
-            id,
-            cancellation,
-            handle: Mutex::new(Some(handle)),
-        }
-    }
-}
-
 #[pyclass(name = "NativeLeaseRequest")]
 struct PyLeaseRequest {
     cancellation: CancellationToken,
-    handle: Mutex<Option<AcpLeaseHandle>>,
+    handle: Mutex<Option<RuntimeLeaseHandle>>,
 }
 
 #[pymethods]
@@ -182,11 +112,11 @@ impl PyLeaseRequest {
 #[pyclass(name = "NativeSessionLease")]
 struct PySessionLease {
     agent_index: usize,
-    lease: Mutex<Option<AcpLease>>,
+    lease: Mutex<Option<RuntimeLease>>,
 }
 
 impl PySessionLease {
-    fn new(lease: AcpLease) -> Self {
+    fn new(lease: RuntimeLease) -> Self {
         Self {
             agent_index: lease.agent_index(),
             lease: Mutex::new(Some(lease)),
@@ -228,32 +158,6 @@ impl PySessionLease {
     }
 }
 
-#[pymethods]
-impl PyTask {
-    #[getter]
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-
-    fn cancel(&self) {
-        self.cancellation.cancel();
-    }
-
-    fn result(&self, py: Python<'_>) -> PyResult<String> {
-        let handle = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("task result can only be awaited once"))?;
-        py.detach(move || {
-            let response = handle.wait().map_err(|error| error.to_string())?;
-            serde_json::to_string(&response).map_err(|error| error.to_string())
-        })
-        .map_err(PyRuntimeError::new_err)
-    }
-}
-
 fn close_pool(pool: Option<Pool>, drain: bool) -> String {
     let Some(mut pool) = pool else {
         return json!({
@@ -277,21 +181,14 @@ fn close_pool(pool: Option<Pool>, drain: bool) -> String {
     .to_string()
 }
 
-fn parse_prompt(prompt_json: &str) -> PyResult<AcpPrompt> {
+fn parse_prompt(prompt_json: &str) -> PyResult<RuntimePrompt> {
     serde_json::from_str(prompt_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid ACP prompt: {error}")))
-}
-
-fn render_feedback(template: &str, error: &AcpError, attempt: usize) -> String {
-    template
-        .replace("{error}", &error.to_string())
-        .replace("{attempt}", &attempt.to_string())
+        .map_err(|error| PyValueError::new_err(format!("invalid agent prompt: {error}")))
 }
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAgentPool>()?;
-    module.add_class::<PyTask>()?;
     module.add_class::<PyLeaseRequest>()?;
     module.add_class::<PySessionLease>()?;
     Ok(())

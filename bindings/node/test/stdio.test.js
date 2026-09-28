@@ -46,13 +46,14 @@ test(
     const testCase = fixture()
     const pool = new AgentPool(testCase.options)
     try {
-      const first = pool.submit('first task')
-      const second = pool.submit('second task')
-      assert.equal(typeof first.id, 'string')
-      assert.deepEqual(await Promise.all([first.result(), second.result()]), [
-        { text: 'mock:first task', stopReason: 'end_turn' },
-        { text: 'mock:second task', stopReason: 'end_turn' },
-      ])
+      const lease = await pool.acquire()
+      assert.deepEqual(await lease.ask('first task'), {
+        text: 'mock:first task', stopReason: 'end_turn',
+      })
+      assert.deepEqual(await lease.ask('second task'), {
+        text: 'mock:second task', stopReason: 'end_turn',
+      })
+      await lease.finish()
       const report = await pool.close({ drain: true })
       assert.deepEqual(report, { closed: true, closeErrors: [], panickedWorkers: 0 })
       assert.deepEqual(pool.status(), { queued: 0, active: 0, closed: true })
@@ -85,12 +86,11 @@ test(
     const testCase = fixture('recover-on-feedback')
     const pool = new AgentPool(testCase.options)
     try {
-      const task = pool.submitRetrying('initial', {
-        maxAttempts: 2,
-        feedbackTemplate: 'Attempt {attempt} failed: {error}. Please retry.',
-      })
-      const response = await task.result()
+      const lease = await pool.acquire()
+      await assert.rejects(() => lease.ask('initial'), /mock failure/)
+      const response = await lease.ask('Attempt 1 failed: mock failure. Please retry.')
       assert.match(response.text, /mock failure/)
+      await lease.finish()
       await pool.close({ drain: true })
 
       const messages = fs
@@ -124,7 +124,7 @@ test(
         text: 'mock:draft',
         stopReason: 'end_turn',
       })
-      const queued = pool.submit('next task')
+      const queued = pool.acquire()
       // The caller validates the draft here, outside any agent call.
       assert.deepEqual(pool.status(), { queued: 1, active: 1, closed: false })
       assert.deepEqual(await lease.ask('correction'), {
@@ -134,10 +134,12 @@ test(
       assert.equal(pool.status().queued, 1)
       await lease.finish()
       lease = null
-      assert.deepEqual(await queued.result(), {
+      const nextLease = await queued
+      assert.deepEqual(await nextLease.ask('next task'), {
         text: 'mock:next task',
         stopReason: 'end_turn',
       })
+      await nextLease.finish()
       await pool.close({ drain: true })
 
       const messages = fs.readFileSync(testCase.logPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse)

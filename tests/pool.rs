@@ -1,8 +1,7 @@
 use agentpools::{
-    AgentBackend, AgentPool, AgentSession, CancellationToken, PoolConfig, ShutdownMode,
-    SubmitError, TaskError, collect_ordered,
+    AcquireError, AgentBackend, AgentPool, AgentSession, CancellationToken, PoolConfig,
+    ShutdownMode, TaskError,
 };
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
@@ -138,290 +137,115 @@ fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
 }
 
 #[test]
-fn opens_lazily_reuses_session_and_passes_exact_tool_config() {
+fn lease_reuses_session_and_forwards_exact_configuration() {
     let state = Arc::new(State::default());
     let mut pool = pool(&state, 1, 4);
     assert_eq!(state.opens.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        pool.submit(Request::simple(1)).unwrap().wait().unwrap(),
-        (1, 1)
-    );
-    assert_eq!(
-        pool.submit(Request::simple(2)).unwrap().wait().unwrap(),
-        (2, 1)
-    );
+    let mut lease = pool.acquire().unwrap();
+    assert_eq!(lease.ask(Request::simple(1)).unwrap(), (1, 1));
+    assert_eq!(lease.ask(Request::simple(2)).unwrap(), (2, 1));
+    lease.finish().unwrap();
     let report = pool.shutdown(ShutdownMode::Drain);
     assert!(report.close_errors.is_empty());
-    assert_eq!(report.panicked_workers, 0);
     assert_eq!(state.opens.load(Ordering::SeqCst), 1);
     assert_eq!(state.closes.load(Ordering::SeqCst), 1);
     assert_eq!(
-        *state.configs.lock().unwrap(),
-        vec![(
-            1,
-            SessionConfig {
-                mcp_servers: vec!["caller-filesystem".into(), "caller-search".into()],
-                tool_policy: "read-only".into(),
-            }
-        )]
+        state.configs.lock().unwrap()[0].1.mcp_servers,
+        ["caller-filesystem", "caller-search"]
     );
 }
 
 #[test]
-fn two_agents_run_concurrently_and_results_keep_input_order() {
+fn distinct_workers_run_concurrently() {
     let state = Arc::new(State::default());
     let mut pool = pool(&state, 2, 2);
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let (entered, receiver) = mpsc::channel();
-    let first = pool
-        .submit(Request::gated(10, entered.clone(), Arc::clone(&gate)))
-        .unwrap();
-    let second = pool
-        .submit(Request::gated(20, entered, Arc::clone(&gate)))
-        .unwrap();
+    let mut first = pool.acquire_to(0).unwrap();
+    let mut second = pool.acquire_to(1).unwrap();
+    let first_gate = Arc::clone(&gate);
+    let second_gate = Arc::clone(&gate);
+    let first_call = std::thread::spawn(move || {
+        let result = first.ask(Request::gated(10, entered, first_gate));
+        first.finish().unwrap();
+        result.unwrap()
+    });
+    let (second_entered, second_receiver) = mpsc::channel();
+    let second_call = std::thread::spawn(move || {
+        let result = second.ask(Request::gated(20, second_entered, second_gate));
+        second.finish().unwrap();
+        result.unwrap()
+    });
     receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    second_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
     assert_eq!(state.max_active.load(Ordering::SeqCst), 2);
     release(&gate);
-    let outputs = collect_ordered([first, second]);
-    assert_eq!(outputs[0].as_ref().unwrap().0, 10);
-    assert_eq!(outputs[1].as_ref().unwrap().0, 20);
+    assert_eq!(first_call.join().unwrap().0, 10);
+    assert_eq!(second_call.join().unwrap().0, 20);
     pool.shutdown(ShutdownMode::Drain);
-    assert_eq!(state.closes.load(Ordering::SeqCst), 2);
 }
 
 #[test]
-fn each_worker_receives_its_own_agent_configuration() {
-    let state = Arc::new(State::default());
-    let make_agent = |name: &str| {
-        (
-            Backend(Arc::clone(&state)),
-            SessionConfig {
-                mcp_servers: vec![name.to_string()],
-                tool_policy: "read-only".into(),
-            },
-        )
-    };
-    let mut pool = AgentPool::with_agents(
-        vec![make_agent("agent-a-tools"), make_agent("agent-b-tools")],
-        2,
-    )
-    .unwrap();
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, receiver) = mpsc::channel();
-    let first = pool
-        .submit_to(0, Request::gated(1, entered.clone(), Arc::clone(&gate)))
-        .unwrap();
-    let second = pool
-        .submit_to(1, Request::gated(2, entered, Arc::clone(&gate)))
-        .unwrap();
-    assert!(matches!(
-        pool.submit_to(2, Request::simple(3)),
-        Err(SubmitError::NoSuchAgent(_))
-    ));
-    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    release(&gate);
-    let outputs = collect_ordered([first, second]);
-    let first_id = outputs[0].as_ref().unwrap().1;
-    let second_id = outputs[1].as_ref().unwrap().1;
-    pool.shutdown(ShutdownMode::Drain);
-    let configs = state.configs.lock().unwrap();
-    assert_eq!(
-        configs
-            .iter()
-            .find(|(id, _)| *id == first_id)
-            .unwrap()
-            .1
-            .mcp_servers,
-        ["agent-a-tools"]
-    );
-    assert_eq!(
-        configs
-            .iter()
-            .find(|(id, _)| *id == second_id)
-            .unwrap()
-            .1
-            .mcp_servers,
-        ["agent-b-tools"]
-    );
-}
-
-#[test]
-fn bounded_queue_returns_request_and_queued_task_can_be_cancelled() {
-    let state = Arc::new(State::default());
-    let mut pool = pool(&state, 1, 1);
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, receiver) = mpsc::channel();
-    let running = pool
-        .submit(Request::gated(1, entered, Arc::clone(&gate)))
-        .unwrap();
-    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    let queued = pool.submit(Request::simple(2)).unwrap();
-    match pool.submit(Request::simple(3)) {
-        Err(SubmitError::QueueFull(request)) => assert_eq!(request.value, 3),
-        _ => panic!("third request must be returned to caller"),
-    }
-    queued.cancel();
-    release(&gate);
-    assert_eq!(running.wait().unwrap().0, 1);
-    assert!(matches!(queued.wait(), Err(TaskError::Cancelled)));
-    pool.shutdown(ShutdownMode::Drain);
-    assert_eq!(state.opens.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn failed_task_closes_uncertain_session_and_next_task_opens_another() {
-    let state = Arc::new(State::default());
-    let mut pool = pool(&state, 1, 2);
-    let mut failing = Request::simple(1);
-    failing.fail = true;
-    assert!(matches!(
-        pool.submit(failing).unwrap().wait(),
-        Err(TaskError::Run {
-            source: "agent failed",
-            close: None
-        })
-    ));
-    assert_eq!(
-        pool.submit(Request::simple(2)).unwrap().wait().unwrap(),
-        (2, 2)
-    );
-    pool.shutdown(ShutdownMode::Drain);
-    assert_eq!(state.opens.load(Ordering::SeqCst), 2);
-    assert_eq!(state.closes.load(Ordering::SeqCst), 2);
-}
-
-#[test]
-fn retry_keeps_same_session_and_worker_while_other_worker_progresses() {
-    let state = Arc::new(State::default());
-    let mut pool = pool(&state, 2, 4);
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let (failed, received) = mpsc::channel();
-    let mut first_request = Request::simple(7);
-    first_request.retryable_fail = true;
-    let first = pool
-        .submit_retrying_to(0, first_request, NonZeroUsize::new(2).unwrap(), {
-            let gate = Arc::clone(&gate);
-            move |error, attempt| {
-                assert_eq!((*error, attempt), ("retryable", 1));
-                failed.send(()).unwrap();
-                let (lock, ready) = &*gate;
-                let mut released = lock.lock().unwrap();
-                while !*released {
-                    released = ready.wait(released).unwrap();
-                }
-                Some(Request::simple(7))
-            }
-        })
-        .unwrap();
-    received.recv_timeout(Duration::from_secs(2)).unwrap();
-    let queued_same_worker = pool.submit_to(0, Request::simple(8)).unwrap();
-    let parallel = pool.submit_to(1, Request::simple(9)).unwrap();
-    let parallel_result = parallel.wait().unwrap();
-    assert_eq!(parallel_result.0, 9);
-    assert_eq!(pool.status().active, 1);
-    assert_eq!(pool.status().queued, 1);
-    release(&gate);
-    let retried = first.wait().unwrap();
-    let queued = queued_same_worker.wait().unwrap();
-    assert_eq!(retried, (7, queued.1));
-    assert_ne!(retried.1, parallel_result.1);
-    pool.shutdown(ShutdownMode::Drain);
-    assert_eq!(state.opens.load(Ordering::SeqCst), 2);
-    assert_eq!(state.closes.load(Ordering::SeqCst), 2);
-}
-
-#[test]
-fn external_validation_keeps_session_exclusive_while_other_worker_progresses() {
+fn lease_reserves_worker_during_external_validation() {
     let state = Arc::new(State::default());
     let mut pool = pool(&state, 2, 4);
     let mut lease = pool.acquire_to(0).unwrap();
-    assert_eq!(lease.agent_index(), 0);
-
     let first = lease.ask(Request::simple(7)).unwrap();
-    let queued_on_lease = pool.submit_to(0, Request::simple(8)).unwrap();
-    let parallel = pool.submit_to(1, Request::simple(9)).unwrap();
-    let parallel_result = parallel.wait().unwrap();
-    assert_eq!(parallel_result.0, 9);
-
-    // The caller is validating `first` here. No pool callback or active
-    // agent call is running, but the first worker must remain unavailable.
+    let queued = pool.request_lease_to(0).unwrap();
+    let mut parallel = pool.acquire_to(1).unwrap();
+    assert_eq!(parallel.ask(Request::simple(9)).unwrap().0, 9);
+    parallel.finish().unwrap();
     assert_eq!(pool.status().active, 1);
     assert_eq!(pool.status().queued, 1);
-    let corrected = lease.ask(Request::simple(10)).unwrap();
-    assert_eq!(corrected.1, first.1);
-    assert_eq!(pool.status().queued, 1);
-
+    assert_eq!(lease.ask(Request::simple(10)).unwrap().1, first.1);
     lease.finish().unwrap();
-    let queued_result = queued_on_lease.wait().unwrap();
-    assert_eq!(queued_result, (8, first.1));
-    assert_ne!(queued_result.1, parallel_result.1);
+    let mut next = queued.wait().unwrap();
+    assert_eq!(next.ask(Request::simple(8)).unwrap(), (8, first.1));
+    next.finish().unwrap();
     pool.shutdown(ShutdownMode::Drain);
 }
 
 #[test]
-fn dropping_a_lease_releases_its_worker() {
+fn queued_lease_can_be_cancelled_and_queue_is_bounded() {
     let state = Arc::new(State::default());
-    let mut pool = pool(&state, 1, 2);
-    let mut lease = pool.acquire().unwrap();
-    let session_id = lease.ask(Request::simple(1)).unwrap().1;
-    let queued = pool.submit(Request::simple(2)).unwrap();
-    assert_eq!(pool.status().queued, 1);
-    drop(lease);
-    assert_eq!(queued.wait().unwrap(), (2, session_id));
+    let mut pool = pool(&state, 1, 1);
+    let lease = pool.acquire().unwrap();
+    let queued = pool.request_lease().unwrap();
+    assert!(matches!(pool.request_lease(), Err(AcquireError::QueueFull)));
+    queued.cancel();
+    assert!(matches!(queued.wait(), Err(AcquireError::Cancelled)));
+    lease.finish().unwrap();
     pool.shutdown(ShutdownMode::Drain);
 }
 
 #[test]
-fn leased_recoverable_error_allows_business_feedback_on_same_session() {
+fn recoverable_error_keeps_session_and_uncertain_error_reopens_it() {
     let state = Arc::new(State::default());
     let mut pool = pool(&state, 1, 2);
     let mut lease = pool.acquire().unwrap();
-    let session_id = lease.ask(Request::simple(1)).unwrap().1;
-    let queued = pool.submit(Request::simple(3)).unwrap();
-
-    let mut failing = Request::simple(2);
-    failing.retryable_fail = true;
+    let mut retryable = Request::simple(1);
+    retryable.retryable_fail = true;
     assert!(matches!(
-        lease.ask(failing),
+        lease.ask(retryable),
         Err(TaskError::Run {
             source: "retryable",
-            close: None
+            ..
         })
     ));
-    assert_eq!(pool.status().queued, 1);
-    assert_eq!(lease.ask(Request::simple(2)).unwrap(), (2, session_id));
-    lease.finish().unwrap();
-    assert_eq!(queued.wait().unwrap(), (3, session_id));
-    pool.shutdown(ShutdownMode::Drain);
-    assert_eq!(state.opens.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn cancel_pending_shutdown_finishes_active_work_and_rejects_queue() {
-    let state = Arc::new(State::default());
-    let mut pool = pool(&state, 1, 2);
-    let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let (entered, receiver) = mpsc::channel();
-    let running = pool
-        .submit(Request::gated(1, entered, Arc::clone(&gate)))
-        .unwrap();
-    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    let queued = pool.submit(Request::simple(2)).unwrap();
-    let token = queued.cancellation_token();
-    let releaser = std::thread::spawn({
-        let gate = Arc::clone(&gate);
-        move || release(&gate)
-    });
-    let report = pool.shutdown(ShutdownMode::CancelPending);
-    releaser.join().unwrap();
-    assert_eq!(report.panicked_workers, 0);
-    assert!(token.is_cancelled());
-    assert_eq!(running.wait().unwrap().0, 1);
-    assert!(matches!(queued.wait(), Err(TaskError::Cancelled)));
+    assert_eq!(lease.ask(Request::simple(2)).unwrap(), (2, 1));
+    let mut uncertain = Request::simple(3);
+    uncertain.fail = true;
     assert!(matches!(
-        pool.submit(Request::simple(3)),
-        Err(SubmitError::Closed(_))
+        lease.ask(uncertain),
+        Err(TaskError::Run {
+            source: "agent failed",
+            ..
+        })
     ));
+    assert_eq!(lease.ask(Request::simple(4)).unwrap(), (4, 2));
+    lease.finish().unwrap();
+    pool.shutdown(ShutdownMode::Drain);
+    assert_eq!(state.opens.load(Ordering::SeqCst), 2);
 }

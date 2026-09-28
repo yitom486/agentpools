@@ -1,7 +1,7 @@
 {
   "name": "agentpools",
   "version": "0.1.0",
-  "description": "Bounded ACP agent session pools for Node.js",
+  "description": "Bounded multi-runtime agent session pools for Node.js",
   "main": "index.js",
   "types": "api.d.ts",
   "files": [
