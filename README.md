@@ -1,162 +1,197 @@
 # agentpools
 
-一个独立的 Rust Agent 会话池。每个任务通过租用独占一个 worker，涵盖多轮请求与调用方校验，直到任务完成并释放。池支持有界队列、取消和关闭清理。旧的直接提交接口已归档。
+> **专为 AI Agent（智能体）打造的多轮独占式会话池与调度引擎**  
+> 像管理数据库连接一样管理你的本地/云端 Agent，完美支持**多轮交互、本地校验、会话热复用与跨语言调用**。  
+> 适用于 Rust、Node.js (`npm`) 与 Python (`pip`)，支持 Windows、Linux 与 macOS 全平台。
 
-## 源码架构
+---
 
-根 crate 的模块划分、各文件职责和请求流转过程见 [src/README.md](src/README.md)。拆分前的单文件版本保存在 [archive/lib.rs](archive/lib.rs)，供对照学习。
+## 💡 为什么需要 agentpools？
 
-## 边界
+### 传统连接池（如数据库连接池）的尴尬：
+传统的连接池（如 HikariCP、r2d2）设计是 **“借出 $\to$ 执行一条 SQL $\to$ 立即归还”**。但 AI Agent 的工作流完全不同：
+1. **冷启动极慢**：启动一个 Agent 子进程（Python/Node 环境、加载模型上下文、认证）往往需要几秒甚至十几秒，不能每次问答都重启；
+2. **多轮业务闭环**：外部代码向 Agent 提问后，常常需要在本地跑测试、检查代码格式、做业务校验，然后再把报错反馈给**同一个 Agent** 继续修改；
+3. **上下文独占**：在整个多轮修改和校验期间，这个 Agent **绝对不能被其他并发任务抢走**，否则对话上下文就串了。
 
-API v1 保持 ACP 配置；API v2 可按 worker 选择 ACP、Codex app-server 或 Pi RPC。见[多运行时使用说明](docs/multi-runtime-usage.md)与[接入设计](docs/runtime-architecture.md)。
+### `agentpools` 的解法：“独占长租约（Lease）”模型
+- 🎯 **租用（Acquire）**：任务开始时租下一个 Worker，这个 Worker 及背后的 Agent 进程就**完全属于你**；
+- 🔄 **多轮交互（Multi-turn）**：你在两次提问之间，哪怕本地卡住校验 10 秒钟，别人也抢不走这个 Worker；
+- ⚡ **热复用（Reuse）**：任务搞定调用 `finish()` 释放后，Agent 进程保持热启动状态，立刻借给下一个任务，零冷启动开销；
+- 🛡️ **智能容错**：遇到 API 限流等普通错误保留会话；遇到进程崩溃或断连自动在原槽位透明重建。
 
-`agentpools` 只负责调度与会话所有权。调用方实现 `AgentBackend::open` 和 `AgentSession::{run, close}`，从而接入 ACP、HTTP API、本地进程或其他 Agent 协议。
+---
 
-**MCP 注入是透传的。** `AgentBackend::Config` 是适配器自定义的类型；池不会读取、修改或合并其中的 MCP server 列表、工具权限、凭据和模型设置。适配器在 `open` 中把调用方提供的配置传给实际 Agent。若某个协议不支持 MCP，适配器可以使用它自己的工具机制，或明确返回能力不支持的错误。可运行示例见 [`examples/mcp_passthrough.rs`](examples/mcp_passthrough.rs)。
+## 🚀 30 秒极速上手
 
-任务开始时调用 acquire 或 request_lease，得到 SessionLease。租用期间可以多次 ask，并在两次调用之间校验、生成反馈；worker 始终属于这个任务。调用 finish 或丢弃租用后，该 worker 才会接下一项工作。其他 worker 可以并行处理自己的任务。
+### 1. Node.js (JavaScript / TypeScript)
 
-适配器仅在 can_retry_after 确认协议仍同步时允许同一会话继续。状态不明的错误关闭会话；租用仍占有原 worker，下一次 ask 会新建会话。
-
-## ACP 适配器：crates/agentpools-acp
-
-[`crates/agentpools-acp/`](crates/agentpools-acp/README.md) 是通用池与 ACP v1 stdio Agent 之间的适配层。它实现根 crate 的 `AgentBackend` / `AgentSession`：按需启动 Agent 进程，完成初始化、认证和会话创建，通过 JSON-RPC 发送 prompt、接收更新与结果，并处理取消、超时和会话关闭。根 crate 不依赖 ACP；Node.js 和 Python 的 API v1 通过多运行时入口使用这个适配层。
-
-| 位置 | 主要内容 |
-| --- | --- |
-| [src/lib.rs](crates/agentpools-acp/src/lib.rs) | `AcpBackend`、`AcpConfig`、`AcpPrompt`、`AcpResponse`、`AcpSession` 和可选的宿主请求处理器。 |
-| [src/transport.rs](crates/agentpools-acp/src/transport.rs) | ACP 子进程的 stdio 传输（基于 [agentpools-transport](crates/agentpools-transport/README.md)）。 |
-| [src/shared_process.rs](crates/agentpools-acp/src/shared_process.rs) | 在 Agent 支持时，让多个独立会话共享一个进程。 |
-| [src/interop.rs](crates/agentpools-acp/src/interop.rs) | 绑定使用的 `AcpPoolOptions` 等 JSON 配置类型及建池入口。 |
-| [stdio 测试](crates/agentpools-acp/tests/stdio.rs)、[Codex 示例](crates/agentpools-acp/examples/codex.rs)、[批量示例](crates/agentpools-acp/examples/batch_add.rs) | 协议测试、真实 Agent 调用和批量任务报告。 |
-
-应用仍需安装并指定 ACP Agent 的可执行入口。此适配层会把调用方提供的 `mcpServers` 配置传给 Agent；具体工具调用由 Agent 完成。详细配置和限制见 [ACP crate README](crates/agentpools-acp/README.md)。
-
-## 多运行时与底层传输
-
-- [`crates/agentpools-runtime/`](crates/agentpools-runtime/README.md)：支持按 worker 混合调度 ACP、Codex app-server 与 Pi RPC，提供统一文本接口、会话容错与协议级取消。
-- [`crates/agentpools-transport/`](crates/agentpools-transport/README.md)：提供跨平台（Windows、Linux、macOS）子进程生命周期管理、换行流解析与优雅退出保护。
-
-## ACP 的两种运行模式
-
-Rust 调度核心始终为每个 worker 启动一个线程；Agent 子进程的数量由 ACP 适配器决定：
-
-| 模式 | Rust 入口 | 4 个 worker 均已启用时的 ACP Agent 子进程 / 会话 | 适用情况 |
-| --- | --- | --- | --- |
-| 独立进程（默认） | `AcpBackend`、`AcpPoolOptions::build()` | 4 个进程 / 4 个会话 | 每个 Agent 需要独立的进程环境，或尚未验证单进程并发会话能力 |
-| 共享进程（显式选择） | `SharedAcpBackend`、`AcpPoolOptions::build_shared()` | 1 个进程 / 4 个独立会话 | ACP Agent 明确支持同一连接上的并发会话 |
-
-两种模式都有 4 个 Rust worker 线程，各 worker 同时只运行一个任务。共享模式通过独立 `sessionId` 和请求 ID 路由回复；一个共享 Agent 进程故障会影响其所有会话。这里的进程数只指 ACP Agent 适配器启动的子进程，MCP server 和 Agent 自己派生的进程另计。共享模式要求各槽位的进程启动、认证及客户端能力配置一致；工作目录、MCP 工具和模型仍可按会话配置。Node.js 和 Python 绑定目前只暴露默认的独立进程模式。选择示例、限制和报告读取方法见[运行模式与测试报告](docs/execution-modes-and-reports.md)。
-
-## 使用
-
-```toml
-[dependencies]
-agentpools = { path = "../agentpools" }
-```
-
-实现 AgentBackend 与 AgentSession 后，创建池并在整个任务期间持有租用：
-
-```rust,ignore
-let mut pool = AgentPool::new(backend, session_config, PoolConfig {
-    workers: 4,
-    max_queued: 128,
-})?;
-let mut lease = pool.acquire()?;
-let mut response = lease.ask(initial_request)?;
-while let Some(feedback) = validate_in_business_code(&response) {
-    response = lease.ask(make_correction_request(feedback))?;
-}
-lease.finish()?;
-let report = pool.shutdown(ShutdownMode::Drain);
-```
-
-with_agents 可以给每个 worker 不同的 Agent 配置；acquire_to(index) 指定 worker。异步调度方可以先调用 request_lease()/request_lease_to(index)，随后用 wait() 获得 SessionLease。
-
-SessionLease 不负责业务校验规则，只保证 worker 独占。调用 shutdown 前必须先释放所有租用，否则关闭会等待仍被占用的 worker。
-
-## 取消与关闭
-
-- LeaseHandle::cancel() 可取消排队的租用；运行中的 ask 可用 ask_with_cancellation 传入 CancellationToken，由适配器协作取消。
-- shutdown(Drain) 处理完队列；shutdown(CancelPending) 取消排队的租用。两者都等待已获得的租用释放。
-- 适配器应为阻塞 I/O 设置超时。不同 MCP 工具配置可用不同池，或通过 with_agents 和 acquire_to 指定 worker。
-
-## npm 与 PyPI 接口
-
-Node.js 和 Python 包都封装了 Rust 池与运行时适配器，使用同一套 camelCase 配置。以下是兼容的 ACP API v1；API v2 的 Codex app-server、Pi RPC 与混合配置见[多运行时使用说明](docs/multi-runtime-usage.md)。`apiVersion: 1` 是必填项；`agents` 中每项对应一个 worker，包含 Agent 程序 `program`、可选 `args`、绝对工作目录 `cwd`，以及可选的 `env`、`model`、`mcpServers` 和 `timeouts`。`maxQueued` 限制排队租用数。绑定当前使用默认的独立进程模式；共享进程模式可通过 Rust API 选择。完整字段见 [TypeScript 定义](bindings/node/api.d.ts)和[语言 API 契约](docs/language-api.md)。
-
-| 操作 | npm 包（Node.js） | PyPI 包（Python） |
-| --- | --- | --- |
-| 创建池 | `new AgentPool(options)` | `AgentPool(options)` |
-| 独占 worker | `await pool.acquire(agentIndex?)` | `await pool.acquire(agent_index=None)` |
-| 调用 Agent | `await lease.ask(prompt)` | `await lease.ask(prompt)` |
-| 查询所选 worker | `lease.agentIndex` | `lease.agent_index` |
-| 归还 worker | `await lease.finish()` | `await lease.finish()`，也可用 `async with` |
-| 状态与关闭 | `pool.status()`、`await pool.close({ drain: true })` | `pool.status()`、`await pool.close(drain=True)` |
-
-`ask` 接受纯文本或含 `content` 数组的 prompt 对象，返回包含 `text` 和 `stopReason` 的响应。校验结果和发送反馈时继续使用同一个 `lease`；`finish` 后 worker 才接下一项租用。直接提交的 `submit` / `Task` 接口已归档。
-
-下面以已安装的 `@agentclientprotocol/codex-acp` 为例。先把它的 `dist/index.js` 绝对路径设为 `CODEX_ACP_ENTRY`，并完成 Agent 所需的认证。**这些包包含绑定和适配器，不包含 Codex ACP 或其他 Agent 可执行程序。**
-
-### Node.js（npm 包）
-
-```js
-const { AgentPool } = require('agentpools')
-
-const entry = process.env.CODEX_ACP_ENTRY
-if (!entry) throw new Error('set CODEX_ACP_ENTRY')
+```javascript
+const { AgentPool } = require('agentpools');
 
 async function main() {
+  // 1. 创建池子：配置 4 个 Worker
   const pool = new AgentPool({
-    apiVersion: 1,
+    apiVersion: 2,
     maxQueued: 32,
-    agents: [{ program: 'node', args: [entry], cwd: process.cwd() }],
-  })
+    agents: [
+      { runtime: 'codexAppServer', program: 'codex', args: ['app-server'], cwd: process.cwd() },
+      { runtime: 'acp', program: 'npx', args: ['@agentclientprotocol/codex-acp'], cwd: process.cwd() }
+    ],
+  });
+
+  // 2. 租下一个独占 Worker（如果都在忙则进入排队）
+  const lease = await pool.acquire();
   try {
-    const lease = await pool.acquire()
-    try {
-      const response = await lease.ask('Add 2 and 3.')
-      console.log(response.text)
-    } finally {
-      await lease.finish()
-    }
-    console.log(pool.status())
+    // 3. 第一轮交互
+    let response = await lease.ask('请用 Rust 写一个快速排序');
+    console.log('Agent 响应:', response.text);
+
+    // 4. 本地执行你的业务校验（期间 Worker 仍然被你独占锁定）
+    // while (testFailed(response.text)) {
+    //   response = await lease.ask('刚才的代码有编译报错，请修复...');
+    // }
   } finally {
-    await pool.close({ drain: true })
+    // 5. 任务结束，归还 Worker 供后续任务复用
+    await lease.finish();
   }
+
+  // 关闭池子（等待正在运行的任务完成）
+  await pool.close({ drain: true });
 }
 
-main().catch(console.error)
+main().catch(console.error);
 ```
 
-### Python（PyPI 包）
+### 2. Python (async/await)
 
 ```python
 import asyncio
 import os
-from pathlib import Path
 from agentpools import AgentPool
 
 async def main():
+    # 支持 async with 上下文管理器，异常自动安全释放 Worker
     async with AgentPool({
-        "apiVersion": 1,
+        "apiVersion": 2,
         "maxQueued": 32,
         "agents": [{
-            "program": "node",
-            "args": [os.environ["CODEX_ACP_ENTRY"]],
-            "cwd": str(Path.cwd()),
+            "runtime": "codexAppServer",
+            "program": "codex",
+            "args": ["app-server"],
+            "cwd": os.getcwd(),
         }],
     }) as pool:
         async with await pool.acquire() as lease:
-            response = await lease.ask("Add 2 and 3.")
-            print(response["text"])
-        print(pool.status())
+            res = await lease.ask("介绍一下 Rust 的所有权机制")
+            print(res["text"])
+            # 可以在同一个 lease 里继续多轮 ask(...)
 
 asyncio.run(main())
 ```
 
-上述示例适用于本地构建或发布后的包。当前仓库可分别在 [bindings/node](bindings/node/README.md) 执行 `npm install`、`npm run build`，以及在 [bindings/python](bindings/python/README.md) 使用 `maturin develop` 本地构建。公开包的发布由 [docs/release.md](docs/release.md) 所述的手动工作流完成；默认运行只准备产物，不上传到 npm 或 PyPI。
+### 3. Rust (原生)
 
-## 验证
+```rust
+use agentpools::{AgentPool, PoolConfig, ShutdownMode};
 
-运行 `cargo test --workspace --all-features --offline`、`cargo clippy --workspace --all-targets --all-features --offline -- -D warnings`，以及两个语言包的 ACP mock 集成测试。4 worker / 16 道加法题的 mock 与真实 Agent 命令、通过条件、`report.json` / `report.html` 及跨平台资源采样报告（`python examples/measure_batch_add.py` 与 PowerShell 脚本），见[运行模式与测试报告](docs/execution-modes-and-reports.md)。真实 Agent 测试需要认证并会消耗模型额度。
+let mut pool = AgentPool::new(backend, config, PoolConfig {
+    workers: 4,
+    max_queued: 128,
+})?;
+
+// 1. 取得独占租约
+let mut lease = pool.acquire()?;
+
+// 2. 多轮提问与校验环路
+let mut res = lease.ask(initial_prompt)?;
+while let Some(feedback) = validate_in_business(&res) {
+    res = lease.ask(feedback)?;
+}
+
+// 3. 归还并优雅关停
+lease.finish()?;
+pool.shutdown(ShutdownMode::Drain);
+```
+
+---
+
+## 🌟 核心特性与架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  语言绑定 (Node.js / Python)                                 │
+│  提供熟悉的 async/await、Promise 与 async with 上下文管理器      │
+├─────────────────────────────────────────────────────────────┤
+│  多运行时适配层 (crates/agentpools-runtime)                   │
+│  统一抹平 ACP、Codex app-server 原生协议与 Pi RPC 的报文差异    │
+├─────────────────────────────────────────────────────────────┤
+│  协议适配层 (crates/agentpools-acp)                          │
+│  实现 ACP 规范，支持独立进程模式与单连接单进程多会话共享模式    │
+├─────────────────────────────────────────────────────────────┤
+│  跨平台传输底层 (crates/agentpools-transport)                 │
+│  处理 Linux/macOS/Windows 进程管道、换行流缓冲与优雅退出强杀    │
+├─────────────────────────────────────────────────────────────┤
+│  调度内核 (agentpools 根 crate)                              │
+│  纯标准库同步原语 (Condvar + Mutex + mpsc)，管理有界队列与租约  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+1. **多协议开箱支持（API v2）**：
+   - **ACP (Agent Client Protocol)**：工业级标准，支持流式内容块与反向权限审批；
+   - **Codex app-server**：OpenAI / Codex 原生客户端协议；
+   - **Pi RPC**：Pi Agent 的 `--mode rpc` 模式；
+   - **混部调度**：同一个池内支持配置不同类型的 Agent，按需分配。
+2. **MCP (Model Context Protocol) 零侵入透传**：
+   - 适配层会把你配置的 `mcpServers`（工具服务器、环境变量等）原封不动透传给 Agent，调度池本身不污染、不篡改你的工具协议。
+3. **全平台进程生命周期与真·取消保障**：
+   - 传统取消只是在宿主端提前返回，后台子进程依然在疯狂消耗 Token；
+   - `agentpools` 在调用取消时，会真正向子进程下发协议级取消信号（Codex 的 `turn/interrupt`、Pi 的 `abort`、ACP 的 `session/cancel`），不浪费 GPU 算力。
+4. **支持 ACP 共享进程模式（省内存）**：
+   - 默认模式：每个 Worker 启动一个独立进程（进程级绝对隔离）；
+   - 共享模式：当 Agent 自身支持多会话时，多个 Worker 可共享同一个长驻进程的 stdio 连接，通过 `sessionId` 多路复用，节省数十倍内存。
+
+---
+
+## 📂 模块导航
+
+| 模块 | 目录 | 职责说明 |
+| :--- | :--- | :--- |
+| **调度核心** | [`src/`](src/README.md) | 纯粹的调度器，管理线程池、等待队列与租约生命周期（零外部依赖）。 |
+| **底层传输** | [`crates/agentpools-transport/`](crates/agentpools-transport/README.md) | 跨平台子进程拉起、换行缓冲与退出强杀保护。 |
+| **ACP 适配器** | [`crates/agentpools-acp/`](crates/agentpools-acp/README.md) | ACP v1 协议实现，包含单进程多路复用共享后端。 |
+| **多运行时** | [`crates/agentpools-runtime/`](crates/agentpools-runtime/README.md) | 统一 ACP、Codex app-server 与 Pi RPC 的文本消息与真实取消。 |
+| **Node.js 绑定** | [`bindings/node/`](bindings/node/README.md) | 基于 `napi-rs`，提供完整的 TypeScript 类型定义。 |
+| **Python 绑定** | [`bindings/python/`](bindings/python/README.md) | 基于 `PyO3`，支持 `async with` 上下文管理。 |
+
+---
+
+## 📖 深入文档
+
+- 🧭 [多运行时接入设计 (架构设计思路)](docs/runtime-architecture.md)
+- 📝 [多运行时配置与使用说明 (API v2 指南)](docs/multi-runtime-usage.md)
+- 📊 [运行模式与跨平台测试报告 (共享模式与基准压测)](docs/execution-modes-and-reports.md)
+- 📜 [语言绑定接口契约规范](docs/language-api.md)
+- 🚀 [构建与跨平台发版指南](docs/release.md)
+
+---
+
+## 🧪 验证与测试
+
+在仓库根目录下运行全套测试：
+
+```bash
+# 1. Rust 核心与全适配器测试
+cargo test --workspace --all-features --offline
+cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
+
+# 2. Node.js 扩展测试
+cd bindings/node && npm test
+
+# 3. Python 扩展测试
+cd bindings/python && python -m unittest discover -s test
+
+# 4. 运行跨平台（Linux、macOS、Windows）并发与内存监控压测
+cargo build -p agentpools-acp --example batch_add --all-features
+python examples/measure_batch_add.py --mode mock
+```
