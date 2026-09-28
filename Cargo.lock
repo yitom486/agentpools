@@ -11,6 +11,7 @@ name = "agentpools-acp"
 version = "0.1.0"
 dependencies = [
  "agentpools",
+ "agentpools-transport",
  "rmcp",
  "serde",
  "serde_json",
@@ -45,6 +46,16 @@ version = "0.1.0"
 dependencies = [
  "agentpools",
  "agentpools-acp",
+ "agentpools-transport",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "agentpools-transport"
+version = "0.1.0"
+dependencies = [
+ "agentpools",
  "serde",
  "serde_json",
 ]

@@ -310,7 +310,7 @@ impl AcpSession {
     }
 
     fn receive_until(
-        &self,
+        &mut self,
         deadline: Instant,
         stage: &'static str,
     ) -> Result<Option<Value>, AcpError> {

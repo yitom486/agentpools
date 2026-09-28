@@ -7,6 +7,7 @@ description = "Runtime adapters and versioned binding configuration for agentpoo
 [dependencies]
 agentpools = { path = "../.." }
 agentpools-acp = { path = "../agentpools-acp" }
+agentpools-transport = { version = "0.1.0", path = "../agentpools-transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

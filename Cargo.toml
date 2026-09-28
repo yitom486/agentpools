@@ -6,7 +6,14 @@ description = "Bounded agent session pools with exclusive worker leases"
 readme = "README.md"
 
 [workspace]
-members = [".", "crates/agentpools-acp", "crates/agentpools-runtime", "bindings/node", "bindings/python"]
+members = [
+    ".",
+    "crates/agentpools-transport",
+    "crates/agentpools-acp",
+    "crates/agentpools-runtime",
+    "bindings/node",
+    "bindings/python",
+]
 resolver = "3"
 
 [dependencies]

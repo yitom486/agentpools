@@ -540,19 +540,12 @@ fn drain_session_events(
 impl Drop for SharedProcess {
     fn drop(&mut self) {
         let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-        drop(child);
-        if let Some(reader) = self
+        let reader = self
             .reader
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = reader.join();
-        }
+            .take();
+        let _ = agentpools_transport::terminate_child(&mut child, reader, Duration::from_millis(500));
     }
 }
 

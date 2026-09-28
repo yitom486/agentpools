@@ -77,3 +77,38 @@ fn acp_configuration_works_in_both_api_versions() {
         let _ = pool.shutdown(ShutdownMode::CancelPending);
     }
 }
+
+#[test]
+fn native_workers_handle_cancellation_and_reuse() {
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+    let options = json!({
+        "apiVersion": 2,
+        "maxQueued": 4,
+        "agents": [
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd},
+            {"runtime":"piRpc","program":program,"args":["pi"],"cwd":cwd}
+        ]
+    });
+    let mut pool = build_pool(&options.to_string()).unwrap();
+    let mut codex = pool.acquire_to(0).unwrap();
+    let cancellation = agentpools::CancellationToken::default();
+    cancellation.cancel();
+    let err = codex.ask_with_cancellation(RuntimePrompt::text("cancel me"), cancellation);
+    assert!(err.is_err());
+    let res = codex.ask(RuntimePrompt::text("after cancel")).unwrap();
+    assert!(res.text.contains("after cancel"));
+    codex.finish().unwrap();
+
+    let mut pi = pool.acquire_to(1).unwrap();
+    let cancellation = agentpools::CancellationToken::default();
+    cancellation.cancel();
+    let err = pi.ask_with_cancellation(RuntimePrompt::text("cancel pi"), cancellation);
+    assert!(err.is_err());
+    let res = pi.ask(RuntimePrompt::text("after pi cancel")).unwrap();
+    assert!(res.text.contains("after pi cancel"));
+    pi.finish().unwrap();
+
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+

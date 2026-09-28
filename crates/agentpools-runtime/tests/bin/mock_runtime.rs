@@ -34,6 +34,9 @@ fn main() {
                         json!({"method":"turn/completed","params":{"turn":{"id":turn_id,"status":"completed"}}}),
                     );
                 }
+                Some("turn/interrupt") => {
+                    emit(json!({"id":message["id"],"result":{}}));
+                }
                 _ => {}
             }
         } else if message["type"] == "get_state" {
@@ -49,6 +52,8 @@ fn main() {
             emit(
                 json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":format!("pi:{text}:{count}")}],"stopReason":"end"}}),
             );
+            emit(json!({"type":"agent_settled"}));
+        } else if message["type"] == "abort" {
             emit(json!({"type":"agent_settled"}));
         }
     }

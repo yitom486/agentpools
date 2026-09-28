@@ -178,6 +178,8 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
         match (self, error) {
             (Self::Acp(session), RuntimeError::Acp(error)) => session.can_retry_after(error),
             (_, RuntimeError::UnsupportedPrompt) => true,
+            (Self::Codex(_), RuntimeError::Remote(_)) => true,
+            (Self::Pi(_), RuntimeError::Remote(_)) => true,
             _ => false,
         }
     }
@@ -250,8 +252,38 @@ impl CodexSession {
             .ok_or_else(|| RuntimeError::Protocol("turn/start returned no turn id".into()))?
             .to_owned();
         let mut answer = String::new();
+        let mut cancel_sent = false;
         loop {
-            let event = self.process.next_event(deadline, cancellation)?;
+            if cancellation.is_cancelled() && !cancel_sent {
+                let cancel_id = self.next_id;
+                self.next_id += 1;
+                let _ = self.process.send(&json!({
+                    "id": cancel_id,
+                    "method": "turn/interrupt",
+                    "params": {
+                        "threadId": self.thread_id,
+                        "turnId": turn_id
+                    }
+                }));
+                cancel_sent = true;
+            }
+            let event = match self.process.next_event(deadline, cancellation) {
+                Ok(event) => event,
+                Err(RuntimeError::Cancelled) if !cancel_sent => {
+                    let cancel_id = self.next_id;
+                    self.next_id += 1;
+                    let _ = self.process.send(&json!({
+                        "id": cancel_id,
+                        "method": "turn/interrupt",
+                        "params": {
+                            "threadId": self.thread_id,
+                            "turnId": turn_id
+                        }
+                    }));
+                    return Err(RuntimeError::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
             if event.get("id").is_some() && event.get("method").is_some() {
                 return Err(RuntimeError::Protocol(
                     "app-server requested an unsupported host interaction".into(),
@@ -338,8 +370,30 @@ impl PiSession {
         let mut settled = false;
         let mut answer = String::new();
         let mut stop_reason = "end".to_owned();
+        let mut cancel_sent = false;
         loop {
-            let event = self.process.next_event(deadline, cancellation)?;
+            if cancellation.is_cancelled() && !cancel_sent {
+                let cancel_id = format!("abort-{}", self.next_id);
+                self.next_id += 1;
+                let _ = self.process.send(&json!({
+                    "id": cancel_id,
+                    "type": "abort"
+                }));
+                cancel_sent = true;
+            }
+            let event = match self.process.next_event(deadline, cancellation) {
+                Ok(event) => event,
+                Err(RuntimeError::Cancelled) if !cancel_sent => {
+                    let cancel_id = format!("abort-{}", self.next_id);
+                    self.next_id += 1;
+                    let _ = self.process.send(&json!({
+                        "id": cancel_id,
+                        "type": "abort"
+                    }));
+                    return Err(RuntimeError::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
             match event.get("type").and_then(Value::as_str) {
                 Some("response") if event["id"] == id => {
                     if event["success"] != true {
