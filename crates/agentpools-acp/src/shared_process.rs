@@ -565,7 +565,8 @@ impl Drop for SharedProcess {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        let _ = agentpools_transport::terminate_child(&mut child, reader, Duration::from_millis(500));
+        let _ =
+            agentpools_transport::terminate_child(&mut child, reader, Duration::from_millis(500));
     }
 }
 

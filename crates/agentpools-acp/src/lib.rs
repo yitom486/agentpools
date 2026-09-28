@@ -243,11 +243,7 @@ impl AcpSession {
         if config.ephemeral {
             session_new_params["ephemeral"] = json!(true);
         }
-        let created = session.call(
-            "session/new",
-            session_new_params,
-            config.handshake_timeout,
-        )?;
+        let created = session.call("session/new", session_new_params, config.handshake_timeout)?;
         session.session_id = created
             .get("sessionId")
             .and_then(Value::as_str)

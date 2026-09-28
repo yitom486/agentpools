@@ -212,7 +212,10 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                 .checked_duration_since(Instant::now())
                 .ok_or(CodexError::Timeout("turn"))?;
 
-            let event = match self.events.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            let event = match self
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
                 Ok(Ok(event)) => event,
                 Ok(Err(err)) => return Err(CodexError::Protocol(err)),
                 Err(RecvTimeoutError::Timeout) => {
@@ -343,10 +346,7 @@ impl SharedCodexProcess {
             .spawn(move || read_messages(stdout, weak))
             .map_err(CodexError::Spawn)?;
 
-        *process
-            .reader
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(reader);
+        *process.reader.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
 
         // Perform initialization
         let _ = process.call(
@@ -498,12 +498,9 @@ impl SharedCodexProcess {
 impl Drop for SharedCodexProcess {
     fn drop(&mut self) {
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        let reader = self
-            .reader
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let _ = agentpools_transport::terminate_child(&mut child, reader, Duration::from_millis(500));
+        let reader = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let _ =
+            agentpools_transport::terminate_child(&mut child, reader, Duration::from_millis(500));
     }
 }
 

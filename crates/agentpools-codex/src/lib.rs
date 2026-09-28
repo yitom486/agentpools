@@ -186,7 +186,9 @@ impl fmt::Display for CodexError {
             Self::Remote(err) => write!(f, "Codex app-server returned error: {err}"),
             Self::Timeout(stage) => write!(f, "Codex app-server {stage} timed out"),
             Self::Cancelled => write!(f, "Codex request cancelled"),
-            Self::UnsupportedPrompt => write!(f, "Codex currently accepts only text content blocks"),
+            Self::UnsupportedPrompt => {
+                write!(f, "Codex currently accepts only text content blocks")
+            }
             Self::NoOutput => write!(f, "Codex returned no text"),
         }
     }
@@ -382,9 +384,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
                 {
                     let item = &event["params"]["item"];
                     if item["type"] == "agentMessage"
-                        && item["phase"]
-                            .as_str()
-                            .is_none_or(|p| p == "final_answer")
+                        && item["phase"].as_str().is_none_or(|p| p == "final_answer")
                         && let Some(text) = item["text"].as_str()
                     {
                         answer = text.to_owned();

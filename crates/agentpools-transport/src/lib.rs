@@ -289,8 +289,12 @@ impl JsonProcess {
     /// Closes stdin (sending EOF to process), then waits up to `grace_period` before force killing.
     pub fn close(&mut self) -> Result<(), TransportError> {
         self.stdin.take();
-        terminate_child(&mut self.child, self.reader.take(), Duration::from_millis(500))
-            .map_err(TransportError::Io)
+        terminate_child(
+            &mut self.child,
+            self.reader.take(),
+            Duration::from_millis(500),
+        )
+        .map_err(TransportError::Io)
     }
 
     /// Terminate immediately with custom grace period.
@@ -329,4 +333,3 @@ mod tests {
         assert_eq!(err.to_string(), "operation cancelled");
     }
 }
-

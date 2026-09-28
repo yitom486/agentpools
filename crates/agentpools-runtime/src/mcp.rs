@@ -3,9 +3,9 @@
 //! Provides a standardized abstraction for MCP servers across different agent runtimes,
 //! including ACP v1/v2 agents and native Codex app-server processes.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// Transport mechanism for an MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,11 +231,12 @@ fn parse_single_mcp_server(
     let is_http = matches!(transport_type, Some("http") | Some("sse")) || url.is_some();
     if is_http {
         let Some(url) = url else {
-            return Err(format!("MCP server '{name}' of type http/sse requires a 'url'"));
+            return Err(format!(
+                "MCP server '{name}' of type http/sse requires a 'url'"
+            ));
         };
         let headers_val = obj.get("headers").or_else(|| obj.get("http_headers"));
-        let headers =
-            parse_key_value_map(headers_val, &format!("MCP server '{name}' headers"))?;
+        let headers = parse_key_value_map(headers_val, &format!("MCP server '{name}' headers"))?;
         Ok(McpServer {
             name: name.to_owned(),
             transport: McpTransport::Http {
@@ -337,7 +338,11 @@ mod tests {
             servers[0].transport,
             McpTransport::Stdio {
                 command: "uvx".into(),
-                args: vec!["mcp-server-sqlite".into(), "--db-path".into(), "./db.sqlite".into()],
+                args: vec![
+                    "mcp-server-sqlite".into(),
+                    "--db-path".into(),
+                    "./db.sqlite".into()
+                ],
                 env: BTreeMap::from([("SQLITE_TIMEOUT".into(), "5000".into())]),
             }
         );
@@ -365,7 +370,10 @@ mod tests {
         let (codex_http_name, codex_http_val) = servers[1].to_codex_entry();
         assert_eq!(codex_http_name, "remote");
         assert_eq!(codex_http_val["url"], "https://mcp.example.com");
-        assert_eq!(codex_http_val["http_headers"]["Authorization"], "Bearer token");
+        assert_eq!(
+            codex_http_val["http_headers"]["Authorization"],
+            "Bearer token"
+        );
     }
 
     #[test]
@@ -397,7 +405,10 @@ mod tests {
         let (name, val) = server.to_codex_entry();
         assert_eq!(name, "github");
         assert_eq!(val["command"], "npx");
-        assert_eq!(val["args"], json!(["-y", "@modelcontextprotocol/server-github"]));
+        assert_eq!(
+            val["args"],
+            json!(["-y", "@modelcontextprotocol/server-github"])
+        );
         assert_eq!(val["env"]["GITHUB_TOKEN"], "secret");
     }
 }

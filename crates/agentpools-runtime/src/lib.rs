@@ -670,7 +670,10 @@ pub fn build_pool(config_json: &str) -> Result<AgentPool<RuntimeBackend>, String
                             .into_config(NativeKind::CodexAppServer)
                             .map_err(|error| format!("agent {index}: {error}"))?;
                         if let Some(shared) = &shared_codex {
-                            RuntimeConfig::SharedCodex(shared.clone(), native_config.to_codex_config())
+                            RuntimeConfig::SharedCodex(
+                                shared.clone(),
+                                native_config.to_codex_config(),
+                            )
                         } else {
                             RuntimeConfig::Native(native_config)
                         }

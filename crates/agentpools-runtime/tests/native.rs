@@ -300,4 +300,3 @@ fn codex_ephemeral_flag_is_configurable() {
     lease.finish().unwrap();
     assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
 }
-
