@@ -141,8 +141,10 @@ fn force_kill(child: &mut Child) -> io::Result<()> {
 unsafe extern "C" {
     /// Minimal libc surface (no new dependency): group signalling only.
     /// `sig == 0` performs existence check without delivering.
+    #[link_name = "killpg"]
     safe fn libc_killpg(pgrp: i32, sig: i32) -> i32;
     /// Minimal libc surface (no new dependency): new process-group leader.
+    #[link_name = "setsid"]
     safe fn libc_setsid() -> i32;
 }
 
