@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use agentpools::CancellationToken;
 use serde_json::Value;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 #[derive(Debug)]
 pub enum TransportError {
     Spawn(io::Error),

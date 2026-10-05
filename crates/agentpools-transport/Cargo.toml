@@ -1,10 +1,10 @@
 [package]
 name = "agentpools-transport"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "Cross-platform stdio process transport and JSON stream parsing for agentpools"
 
 [dependencies]
-agentpools = { version = "0.1.5", path = "../.." }
+agentpools = { version = "0.1.6", path = "../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
