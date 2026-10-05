@@ -87,6 +87,12 @@ export interface CodexAppServerAgentOptions {
   effort?: string | null
   /** MCP servers injected via thread/start config.mcp_servers (stdio or http entries). */
   mcpServers?: unknown[]
+  /** Thread approval policy. Absent means the native `"never"` default (anything needing approval is denied). */
+  approvalPolicy?: string | null
+  /** Opt-in auto-approval for MCP tool-call elicitations. Default false; enable only for first-party localhost tool servers. */
+  autoApproveMcpToolCalls?: boolean | null
+  /** Sandbox for model-executed shell commands (official SandboxMode). Absent = server default. */
+  sandbox?: string | null
   timeouts?: NativeTimeouts
   inheritStderr?: boolean
   ephemeral?: boolean

@@ -106,6 +106,9 @@ impl SharedCodexManager {
         if let Some(model) = &config.model {
             params["model"] = json!(model);
         }
+        if let Some(sandbox) = &config.sandbox {
+            params["sandbox"] = json!(sandbox);
+        }
         if let Some(mcp) = &config.mcp_servers {
             params["config"] = json!({ "mcp_servers": mcp });
         }
@@ -135,6 +138,7 @@ impl SharedCodexManager {
             closed: false,
             effort: config.effort.clone(),
             activity: None,
+            auto_approve_mcp_tool_calls: config.auto_approve_mcp_tool_calls,
         })
     }
 }
@@ -153,6 +157,7 @@ pub struct SharedCodexSession {
     closed: bool,
     effort: Option<String>,
     activity: Option<ActivitySink>,
+    auto_approve_mcp_tool_calls: bool,
 }
 
 impl SharedCodexSession {
@@ -237,6 +242,19 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                 }
             };
             record_activity(&self.activity, "activity", Some(turn_id.clone()));
+
+            if event.get("id").and_then(Value::as_u64).is_some()
+                && event.get("method").and_then(Value::as_str)
+                    == Some("mcpServer/elicitation/request")
+                && self.auto_approve_mcp_tool_calls
+                && let Some(id) = event.get("id").and_then(Value::as_u64)
+            {
+                let _ = self.process.send(&json!({
+                    "id": id,
+                    "result": {"action": "accept", "content": {}}
+                }));
+                continue;
+            }
 
             match event.get("method").and_then(Value::as_str) {
                 Some("item/completed") => {

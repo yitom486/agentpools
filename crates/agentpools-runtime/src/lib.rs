@@ -143,6 +143,16 @@ pub struct NativeConfig {
     model: Option<String>,
     effort: Option<String>,
     mcp_servers: Vec<McpServer>,
+    /// Codex thread approval policy (default `"never"` = deny anything that
+    /// needs approval). Unattended MCP tool calls require a policy that lets
+    /// them run, e.g. `"untrusted"`.
+    approval_policy: String,
+    /// Opt-in auto-approval for the app-server's MCP tool-call elicitations.
+    /// Default `false`; hosts must explicitly accept unattended tool runs.
+    auto_approve_mcp_tool_calls: bool,
+    /// Sandbox for model-executed shell commands (official SandboxMode).
+    /// Absent = server default.
+    sandbox: Option<String>,
     ephemeral: bool,
     handshake_timeout: Duration,
     prompt_timeout: Duration,
@@ -170,6 +180,9 @@ impl NativeConfig {
             model: None,
             effort: None,
             mcp_servers: Vec::new(),
+            approval_policy: "never".to_owned(),
+            auto_approve_mcp_tool_calls: false,
+            sandbox: None,
             ephemeral: true,
             handshake_timeout: Duration::from_millis(default_handshake_ms()),
             prompt_timeout: Duration::from_millis(default_prompt_ms()),
@@ -250,6 +263,11 @@ impl NativeConfig {
         }
         if let Some(effort) = &self.effort {
             config = config.with_effort(effort);
+        }
+        config = config.with_approval_policy(self.approval_policy.clone());
+        config = config.with_auto_approve_mcp_tool_calls(self.auto_approve_mcp_tool_calls);
+        if let Some(sandbox) = &self.sandbox {
+            config = config.with_sandbox(sandbox);
         }
         if !self.mcp_servers.is_empty() {
             let mut mcp_map = serde_json::Map::new();
@@ -533,6 +551,16 @@ struct NativeAgentOptions {
     /// (mirrors the host Codex adapter per-turn `effort`).
     #[serde(default)]
     effort: Option<String>,
+    /// Codex thread approval policy. Absent means the native `"never"` default.
+    #[serde(default)]
+    approval_policy: Option<String>,
+    /// Opt-in auto-approval for MCP tool-call elicitations. Default `false`.
+    #[serde(default)]
+    auto_approve_mcp_tool_calls: bool,
+    /// Sandbox for model-executed shell commands (official SandboxMode).
+    /// Absent = server default.
+    #[serde(default)]
+    sandbox: Option<String>,
     #[serde(default)]
     mcp_servers: Option<Value>,
     #[serde(default = "default_true")]
@@ -614,6 +642,9 @@ impl NativeAgentOptions {
             model: self.model,
             effort: self.effort,
             mcp_servers,
+            approval_policy: self.approval_policy.unwrap_or_else(|| "never".to_owned()),
+            auto_approve_mcp_tool_calls: self.auto_approve_mcp_tool_calls,
+            sandbox: self.sandbox,
             ephemeral: self.ephemeral,
             handshake_timeout: Duration::from_millis(self.timeouts.handshake_ms),
             prompt_timeout: Duration::from_millis(self.timeouts.prompt_ms),
