@@ -1,6 +1,6 @@
 {
   "name": "agentpools",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Bounded multi-runtime agent session pools for Node.js",
   "main": "index.js",
   "types": "api.d.ts",

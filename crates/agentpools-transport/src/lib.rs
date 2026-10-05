@@ -79,6 +79,11 @@ impl ProcessConfig {
 /// 2. If not, waits up to `grace_period` for clean exit.
 /// 3. If still running, forcefully terminates the child, handling platform-specific error quirks.
 /// 4. Waits for the child and joins the reader thread.
+///
+/// Termination covers the whole process tree the child may have grown:
+/// on Windows the child is assigned to a kill-on-close Job at spawn;
+/// on Unix the child starts as a process-group leader and the group is signalled.
+/// Either way a wedged child (or a parent that died without `close`) leaves no orphans.
 pub fn terminate_child(
     child: &mut Child,
     reader: Option<JoinHandle<()>>,
@@ -95,13 +100,7 @@ pub fn terminate_child(
             thread::sleep(Duration::from_millis(10));
         }
         if !exited {
-            match child.kill() {
-                Ok(()) => {}
-                // On Windows, killing an already exited process may return InvalidInput or PermissionDenied
-                Err(err) if err.kind() == io::ErrorKind::InvalidInput => {}
-                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
-                Err(err) => return Err(err),
-            }
+            force_kill(child)?;
         }
     }
     let _ = child.wait();
@@ -109,6 +108,39 @@ pub fn terminate_child(
         let _ = handle.join();
     }
     Ok(())
+}
+
+/// Forcefully terminate a (possibly wedged) child without blocking.
+/// Direct-child kill plus whole-tree coverage; already-exited races are ignored.
+fn force_kill(child: &mut Child) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // Own process group (see `spawn`): signal the group so grandchildren die too.
+        let pgid = child.id() as i32;
+        if libc_killpg(pgid, 9) == 0 {
+            return Ok(());
+        }
+        // ESRCH (already gone) is fine; anything else falls through to child.kill().
+        if libc_killpg(pgid, 0) != 0 {
+            return Ok(());
+        }
+    }
+    match child.kill() {
+        Ok(()) => Ok(()),
+        // On Windows, killing an already exited process may return InvalidInput or PermissionDenied
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    /// Minimal libc surface (no new dependency): group signalling only.
+    /// `sig == 0` performs existence check without delivering.
+    safe fn libc_killpg(pgrp: i32, sig: i32) -> i32;
+    /// Minimal libc surface (no new dependency): new process-group leader.
+    safe fn libc_setsid() -> i32;
 }
 
 /// Dedicated JSON-RPC/line-delimited stdio transport for a single child process.
@@ -119,6 +151,97 @@ pub struct JsonProcess {
     pending: VecDeque<Value>,
     reader: Option<JoinHandle<()>>,
     process_id: u32,
+    /// Windows containment: open until drop so wedged grandchildren die with us.
+    #[cfg(windows)]
+    _job: Option<WindowsJob>,
+}
+
+/// Windows Job Object with kill-on-close (no new dependency: hand-rolled FFI).
+/// The child is assigned right after spawn; if the parent dies, crashes, or
+/// never calls `close`, the OS reaps the whole tree. Assignment can fail
+/// (e.g. nested-job conflict) — that only falls back to plain spawn.
+#[cfg(windows)]
+struct WindowsJob {
+    handle: *mut core::ffi::c_void,
+}
+
+#[cfg(windows)]
+mod win_job {
+    use super::WindowsJob;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    type Bool = i32;
+
+    #[repr(C)]
+    struct BasicLimitInfo {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: Dword,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: Dword,
+        affinity: usize,
+        priority_class: Dword,
+        scheduling_class: Dword,
+    }
+
+    const JOB_OBJECT_BASIC_LIMIT_INFORMATION: Dword = 2;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
+
+    unsafe extern "system" {
+        safe fn CreateJobObjectW(attributes: *const core::ffi::c_void, name: *const u16) -> Handle;
+        safe fn SetInformationJobObject(
+            job: Handle,
+            info_class: Dword,
+            info: *const core::ffi::c_void,
+            info_len: Dword,
+        ) -> Bool;
+        safe fn AssignProcessToJobObject(job: Handle, process: Handle) -> Bool;
+        safe fn CloseHandle(object: Handle) -> Bool;
+    }
+
+    impl WindowsJob {
+        pub(super) fn contain(process: Handle) -> Option<Self> {
+            // SAFETY: raw job/create/assign syscalls with valid local buffers; null handles checked.
+            let job = CreateJobObjectW(core::ptr::null(), core::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let info = BasicLimitInfo {
+                per_process_user_time_limit: 0,
+                per_job_user_time_limit: 0,
+                limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                minimum_working_set_size: 0,
+                maximum_working_set_size: 0,
+                active_process_limit: 0,
+                affinity: 0,
+                priority_class: 0,
+                scheduling_class: 0,
+            };
+            let ok = SetInformationJobObject(
+                job,
+                JOB_OBJECT_BASIC_LIMIT_INFORMATION,
+                (&raw const info).cast(),
+                size_of::<BasicLimitInfo>() as Dword,
+            ) != 0
+                && AssignProcessToJobObject(job, process) != 0;
+            if !ok {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self { handle: job })
+        }
+    }
+
+    impl Drop for WindowsJob {
+        fn drop(&mut self) {
+            CloseHandle(self.handle);
+        }
+    }
+
+    // Handles are only closed on drop; never shared across threads unsafely.
+    unsafe impl Send for WindowsJob {}
 }
 
 impl JsonProcess {
@@ -136,6 +259,19 @@ impl JsonProcess {
                 Stdio::null()
             });
 
+        // Unix: own process group so `force_kill` reaps grandchildren too.
+        // A forked child is never a group leader, so setsid cannot fail here;
+        // a failure aborts spawn loudly instead of mis-signalling our own group.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc_setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut child = command.spawn().map_err(TransportError::Spawn)?;
         let stdin = child
             .stdin
@@ -146,6 +282,14 @@ impl JsonProcess {
             .take()
             .ok_or_else(|| TransportError::Protocol("missing child stdout pipe".into()))?;
         let process_id = child.id();
+
+        // Windows: contain the child tree so crashes/wedges without `close`
+        // leave no orphans. Best-effort: nested-job conflicts fall back to plain spawn.
+        #[cfg(windows)]
+        let contained = {
+            use std::os::windows::io::AsRawHandle;
+            WindowsJob::contain(child.as_raw_handle())
+        };
 
         let (sender, incoming) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -184,6 +328,8 @@ impl JsonProcess {
             pending: VecDeque::new(),
             reader: Some(reader),
             process_id,
+            #[cfg(windows)]
+            _job: contained,
         })
     }
 
@@ -323,6 +469,91 @@ mod tests {
         assert!(!config.inherit_stderr);
         assert!(config.args.is_empty());
         assert!(config.env.is_empty());
+    }
+
+    /// Portable sleeper config for lifecycle tests (no external tools assumed).
+    #[cfg(test)]
+    fn sleeper_config() -> ProcessConfig {
+        let mut config = if cfg!(windows) {
+            ProcessConfig::new("cmd", ".")
+        } else {
+            ProcessConfig::new("sleep", ".")
+        };
+        if cfg!(windows) {
+            config.args = vec!["/C".into(), "ping -n 30 127.0.0.1 >nul".into()];
+        } else {
+            config.args = vec!["30".into()];
+        }
+        config
+    }
+
+    #[cfg(test)]
+    fn pid_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            libc_killpg(pid as i32, 0) == 0
+        }
+        #[cfg(windows)]
+        {
+            // Query-then-close a process handle; null handle means gone.
+            let handle = open_process(QUERY_LIMITED, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = exit_code(handle, &mut code) != 0;
+            close_handle(handle);
+            ok && code == STILL_ACTIVE
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = pid;
+            true
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    mod win_pid {
+        pub(super) type Handle = *mut core::ffi::c_void;
+        pub(super) const STILL_ACTIVE: u32 = 259;
+        pub(super) const QUERY_LIMITED: u32 = 0x1000;
+        unsafe extern "system" {
+            #[link_name = "OpenProcess"]
+            pub(super) safe fn open_process(access: u32, inherit: i32, pid: u32) -> Handle;
+            #[link_name = "GetExitCodeProcess"]
+            pub(super) safe fn exit_code(handle: Handle, code: *mut u32) -> i32;
+            #[link_name = "CloseHandle"]
+            pub(super) safe fn close_handle(handle: Handle) -> i32;
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    use win_pid::{QUERY_LIMITED, STILL_ACTIVE, close_handle, exit_code, open_process};
+
+    #[cfg(test)]
+    fn wait_gone(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        !pid_alive(pid)
+    }
+
+    #[test]
+    fn drop_without_close_leaves_no_orphan() {
+        // Production spawn path (pipes + reader + containment), never closed.
+        let process = JsonProcess::spawn(&sleeper_config()).expect("sleeper spawns");
+        let pid = process.process_id();
+        assert!(pid_alive(pid), "sleeper must be alive before drop");
+        // Never call close(): Drop alone must reap the child.
+        drop(process);
+        assert!(
+            wait_gone(pid, Duration::from_secs(10)),
+            "child {pid} survived Drop without close"
+        );
     }
 
     #[test]
