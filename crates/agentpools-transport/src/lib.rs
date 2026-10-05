@@ -107,10 +107,26 @@ pub fn terminate_child(
         }
     }
     let _ = child.wait();
-    if let Some(handle) = reader {
-        let _ = handle.join();
-    }
+    join_reader(reader, Duration::from_secs(2));
     Ok(())
+}
+
+/// Join the stdout reader without hanging Drop forever: grandchildren can
+/// inherit the stdout pipe and hold it open after the direct child dies
+/// (observed: 29s Drop on Windows). Abandoned readers exit on EOF.
+fn join_reader(reader: Option<JoinHandle<()>>, timeout: Duration) {
+    let Some(handle) = reader else { return };
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Still blocked on an inherited pipe: detach. It exits when the pipe
+    // closes (process-group kill on Unix, Job close on Windows). Never block
+    // Drop/shutdown on it.
 }
 
 /// Forcefully terminate a (possibly wedged) child without blocking.
@@ -146,6 +162,10 @@ unsafe extern "C" {
     /// Minimal libc surface (no new dependency): new process-group leader.
     #[link_name = "setsid"]
     safe fn libc_setsid() -> i32;
+    /// Minimal libc surface (no new dependency): liveness probe for one pid.
+    /// `sig == 0` performs existence check without delivering.
+    #[link_name = "kill"]
+    safe fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 /// Dedicated JSON-RPC/line-delimited stdio transport for a single child process.
@@ -191,8 +211,33 @@ mod win_job {
         scheduling_class: Dword,
     }
 
-    const JOB_OBJECT_BASIC_LIMIT_INFORMATION: Dword = 2;
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInfo {
+        basic: BasicLimitInfo,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: Dword = 9;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
+
+    // ABI locks: the OS validates buffer length exactly.
+    const _: [(); 64] = [(); size_of::<BasicLimitInfo>()];
+    const _: [(); 48] = [(); size_of::<IoCounters>()];
+    const _: [(); 144] = [(); size_of::<ExtendedLimitInfo>()];
 
     unsafe extern "system" {
         safe fn CreateJobObjectW(attributes: *const core::ffi::c_void, name: *const u16) -> Handle;
@@ -208,30 +253,48 @@ mod win_job {
 
     impl WindowsJob {
         pub(super) fn contain(process: Handle) -> Option<Self> {
-            // SAFETY: raw job/create/assign syscalls with valid local buffers; null handles checked.
+            // Raw job/create/assign syscalls with valid local buffers; null handles checked.
             let job = CreateJobObjectW(core::ptr::null(), core::ptr::null());
             if job.is_null() {
                 return None;
             }
-            let info = BasicLimitInfo {
-                per_process_user_time_limit: 0,
-                per_job_user_time_limit: 0,
-                limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                minimum_working_set_size: 0,
-                maximum_working_set_size: 0,
-                active_process_limit: 0,
-                affinity: 0,
-                priority_class: 0,
-                scheduling_class: 0,
+            let info = ExtendedLimitInfo {
+                basic: BasicLimitInfo {
+                    per_process_user_time_limit: 0,
+                    per_job_user_time_limit: 0,
+                    limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    minimum_working_set_size: 0,
+                    maximum_working_set_size: 0,
+                    active_process_limit: 0,
+                    affinity: 0,
+                    priority_class: 0,
+                    scheduling_class: 0,
+                },
+                io: IoCounters {
+                    read_operation_count: 0,
+                    write_operation_count: 0,
+                    other_operation_count: 0,
+                    read_transfer_count: 0,
+                    write_transfer_count: 0,
+                    other_transfer_count: 0,
+                },
+                process_memory_limit: 0,
+                job_memory_limit: 0,
+                peak_process_memory_used: 0,
+                peak_job_memory_used: 0,
             };
-            let ok = SetInformationJobObject(
+            // Best-effort containment: nested-job conflicts fall back to plain spawn.
+            if SetInformationJobObject(
                 job,
-                JOB_OBJECT_BASIC_LIMIT_INFORMATION,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
                 (&raw const info).cast(),
-                size_of::<BasicLimitInfo>() as Dword,
-            ) != 0
-                && AssignProcessToJobObject(job, process) != 0;
-            if !ok {
+                size_of::<ExtendedLimitInfo>() as Dword,
+            ) == 0
+            {
+                CloseHandle(job);
+                return None;
+            }
+            if AssignProcessToJobObject(job, process) == 0 {
                 CloseHandle(job);
                 return None;
             }
@@ -440,6 +503,11 @@ impl JsonProcess {
     /// Closes stdin (sending EOF to process), then waits up to `grace_period` before force killing.
     pub fn close(&mut self) -> Result<(), TransportError> {
         self.stdin.take();
+        // Windows: release containment first so kill-on-close reaps
+        // grandchildren before we join the stdout reader (they may hold the
+        // pipe open and stall the join).
+        #[cfg(windows)]
+        drop(self._job.take());
         terminate_child(
             &mut self.child,
             self.reader.take(),
@@ -451,6 +519,8 @@ impl JsonProcess {
     /// Terminate immediately with custom grace period.
     pub fn terminate(&mut self, grace_period: Duration) -> Result<(), TransportError> {
         self.stdin.take();
+        #[cfg(windows)]
+        drop(self._job.take());
         terminate_child(&mut self.child, self.reader.take(), grace_period)
             .map_err(TransportError::Io)
     }
@@ -496,7 +566,7 @@ mod tests {
     fn pid_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
-            libc_killpg(pid as i32, 0) == 0
+            libc_kill(pid as i32, 0) == 0
         }
         #[cfg(windows)]
         {
@@ -553,8 +623,21 @@ mod tests {
         let process = JsonProcess::spawn(&sleeper_config()).expect("sleeper spawns");
         let pid = process.process_id();
         assert!(pid_alive(pid), "sleeper must be alive before drop");
-        // Never call close(): Drop alone must reap the child.
+        #[cfg(windows)]
+        assert!(
+            process._job.is_some(),
+            "job containment must be established at spawn"
+        );
+        // Never call close(): Drop alone must reap the child, fast: the
+        // sleeper outlives any correct kill by an order of magnitude, so a
+        // slow Drop means the kill path is vacuous.
+        let started = Instant::now();
         drop(process);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "Drop took {:?}, kill path looks vacuous",
+            started.elapsed()
+        );
         assert!(
             wait_gone(pid, Duration::from_secs(10)),
             "child {pid} survived Drop without close"
