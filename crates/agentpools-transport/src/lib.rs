@@ -130,18 +130,17 @@ fn join_reader(reader: Option<JoinHandle<()>>, timeout: Duration) {
 }
 
 /// Forcefully terminate a (possibly wedged) child without blocking.
-/// Direct-child kill plus whole-tree coverage; already-exited races are ignored.
+/// Always terminates the direct child; additionally signals the whole
+/// process group when the child leads one (our own spawn path calls setsid).
+/// Group-signal failure must never skip the direct kill: a child spawned
+/// without setsid (e.g. the shared ACP process) is not a group leader, and
+/// `killpg` on its pid returns ESRCH even though the child is alive.
 fn force_kill(child: &mut Child) -> io::Result<()> {
     #[cfg(unix)]
     {
-        // Own process group (see `spawn`): signal the group so grandchildren die too.
         let pgid = child.id() as i32;
-        if libc_killpg(pgid, 9) == 0 {
-            return Ok(());
-        }
-        // ESRCH (already gone) is fine; anything else falls through to child.kill().
-        if libc_killpg(pgid, 0) != 0 {
-            return Ok(());
+        if libc_killpg(pgid, 0) == 0 {
+            let _ = libc_killpg(pgid, 9);
         }
     }
     match child.kill() {
@@ -164,6 +163,7 @@ unsafe extern "C" {
     safe fn libc_setsid() -> i32;
     /// Minimal libc surface (no new dependency): liveness probe for one pid.
     /// `sig == 0` performs existence check without delivering.
+    #[cfg(test)]
     #[link_name = "kill"]
     safe fn libc_kill(pid: i32, sig: i32) -> i32;
 }
@@ -642,6 +642,37 @@ mod tests {
             wait_gone(pid, Duration::from_secs(10)),
             "child {pid} survived Drop without close"
         );
+    }
+
+    #[test]
+    fn terminate_child_kills_non_group_leader() {
+        // Regression: a child spawned WITHOUT setsid (e.g. the shared ACP
+        // process) is not a group leader, so killpg on its pid returns ESRCH
+        // while it is still alive. terminate_child must still kill it instead
+        // of hanging in wait() forever.
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping -n 30 127.0.0.1 >nul"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("sleeper spawns");
+        let pid = child.id();
+        let started = Instant::now();
+        terminate_child(&mut child, None, Duration::from_millis(500)).expect("terminate works");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "terminate_child hung or stalled: {:?}",
+            started.elapsed()
+        );
+        assert!(!pid_alive(pid), "child {pid} survived terminate_child");
     }
 
     #[test]
