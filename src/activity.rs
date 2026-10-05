@@ -72,10 +72,10 @@ pub fn activity_sink() -> ActivitySink {
 
 /// Append a marker; lock poisoning degrades to dropping the marker, never to failing the turn.
 pub fn record_activity(sink: &Option<ActivitySink>, kind: &'static str, turn_id: Option<String>) {
-    if let Some(sink) = sink {
-        if let Ok(mut events) = sink.lock() {
-            events.push(ActivityEvent::new(kind, turn_id));
-        }
+    if let Some(sink) = sink
+        && let Ok(mut events) = sink.lock()
+    {
+        events.push(ActivityEvent::new(kind, turn_id));
     }
 }
 
