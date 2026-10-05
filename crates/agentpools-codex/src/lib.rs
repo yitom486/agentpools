@@ -509,7 +509,10 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
                     "threadId": self.thread_id
                 }
             }));
-            let deadline = Instant::now() + self.close_timeout;
+            // Best-effort ephemeral cleanup: never let a busy or hung server
+            // stall session teardown (and therefore cancellation) longer than
+            // a short grace period. The process itself is closed below.
+            let deadline = Instant::now() + self.close_timeout.min(Duration::from_secs(1));
             let _ = self.process.response(delete_id, deadline, None);
         }
         self.process.close().map_err(CodexError::from)

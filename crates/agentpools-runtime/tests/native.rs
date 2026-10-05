@@ -117,9 +117,11 @@ fn native_workers_handle_cancellation_and_reuse() {
 #[test]
 fn codex_mid_turn_cancel_returns_promptly_and_reuses_lease() {
     // The mock sleeps 3s before acking `turn/start` for `wait:*` prompts.
-    // Cancelling mid-turn must return Cancelled promptly (not after the full
-    // delay), record a `cancelled` marker, and keep the lease reusable on the
-    // same session instead of tearing it down and respawning.
+    // Cancelling mid-turn must interrupt the wait promptly (not after the full
+    // delay), record a `cancelled` marker, and close the session; the lease
+    // stays usable because the next ask transparently reopens the session
+    // (close-on-cancel is the approved cross-backend contract, cf. the ACP
+    // `cancellation_sends_acp_cancel_and_closes_session` test).
     let program = env!("CARGO_BIN_EXE_mock_runtime");
     let cwd = std::env::current_dir().unwrap();
     let options = json!({
@@ -165,15 +167,19 @@ fn codex_mid_turn_cancel_returns_promptly_and_reuses_lease() {
         "cancel did not interrupt the active ask promptly: {elapsed:?}"
     );
     assert!(
-        matches!(outcome, Err(TaskError::Cancelled)),
-        "expected TaskError::Cancelled, got {outcome:?}"
+        matches!(outcome, Err(TaskError::Run { .. })),
+        "expected TaskError::Run after cancel-close, got {outcome:?}"
     );
     assert!(
         markers.contains(&"cancelled"),
         "expected a cancelled marker, got {markers:?}"
     );
-    // Same session kept: the mock turn counter continues instead of restarting.
-    assert_eq!(reuse.unwrap(), "codex:again:2");
+    // Lease reusable: cancel closes the session, so the next ask reopens it.
+    // Standalone sessions own their process, therefore reopening respawns it
+    // and the mock turn counter restarts at 1. (Production uses sharedProcess,
+    // where only the thread is replaced.) What matters: the same lease keeps
+    // working with correct results.
+    assert_eq!(reuse.unwrap(), "codex:again:1");
     lease.finish().unwrap();
     assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
 }

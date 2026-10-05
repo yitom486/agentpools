@@ -277,12 +277,14 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
         self.closed = true;
         let mut result = Ok(());
         if self.ephemeral && !self.thread_id.is_empty() {
+            // Best-effort ephemeral cleanup, same bound as the standalone
+            // session: a busy server must not stall teardown/cancellation.
             let delete_res = self.process.call(
                 "thread/delete",
                 json!({
                     "threadId": self.thread_id
                 }),
-                self.close_timeout,
+                self.close_timeout.min(Duration::from_secs(1)),
                 "thread/delete",
             );
             if let Err(e) = delete_res {
