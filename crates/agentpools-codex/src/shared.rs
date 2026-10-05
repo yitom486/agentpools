@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentBackend, AgentSession, CancellationToken, record_activity, ActivitySink};
+use agentpools::{ActivitySink, AgentBackend, AgentSession, CancellationToken, record_activity};
 use serde_json::{Value, json};
 
 use crate::{CodexConfig, CodexError, CodexPrompt, CodexResponse};
@@ -187,12 +187,9 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
         if let Some(effort) = &self.effort {
             turn_params["effort"] = json!(effort);
         }
-        let start_res = self.process.call(
-            "turn/start",
-            turn_params,
-            self.prompt_timeout,
-            "turn/start",
-        )?;
+        let start_res =
+            self.process
+                .call("turn/start", turn_params, self.prompt_timeout, "turn/start")?;
         let turn_id = start_res
             .pointer("/turn/id")
             .and_then(Value::as_str)

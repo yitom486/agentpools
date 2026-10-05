@@ -81,5 +81,7 @@ pub fn record_activity(sink: &Option<ActivitySink>, kind: &'static str, turn_id:
 
 /// Take all buffered markers, leaving the buffer empty.
 pub fn drain_activity(sink: &ActivitySink) -> Vec<ActivityEvent> {
-    sink.lock().map(|mut events| std::mem::take(&mut *events)).unwrap_or_default()
+    sink.lock()
+        .map(|mut events| std::mem::take(&mut *events))
+        .unwrap_or_default()
 }

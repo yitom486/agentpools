@@ -18,7 +18,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentBackend, AgentSession, CancellationToken, record_activity, ActivitySink};
+use agentpools::{ActivitySink, AgentBackend, AgentSession, CancellationToken, record_activity};
 use agentpools_transport::{JsonProcess, ProcessConfig, TransportError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

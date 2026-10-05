@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use agentpools::{AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode, activity_sink, drain_activity, ActivitySink};
+use agentpools::{
+    ActivitySink, AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode,
+    activity_sink, drain_activity,
+};
 use agentpools_runtime::{RuntimeBackend, RuntimePrompt, build_pool};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

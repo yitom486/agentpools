@@ -590,7 +590,10 @@ impl NativeAgentOptions {
             return Err("set the Pi model through args, for example --model <id>".into());
         }
         if matches!(kind, NativeKind::PiRpc) && self.effort.is_some() {
-            return Err("Pi RPC runtime does not accept reasoning effort; set the Pi model through args".into());
+            return Err(
+                "Pi RPC runtime does not accept reasoning effort; set the Pi model through args"
+                    .into(),
+            );
         }
         let mcp_servers = if let Some(mcp) = &self.mcp_servers {
             parse_mcp_servers(mcp)?
