@@ -215,6 +215,7 @@ fn language_config_builds_pool_and_forwards_mcp_servers_to_acp() {
                 close_ms: 2_000,
             },
             inherit_stderr: false,
+            auto_approve_permissions: false,
             ephemeral: true,
         }],
         max_queued: 4,
@@ -388,6 +389,23 @@ fn cancellation_sends_acp_cancel_and_closes_session() {
     let messages = log(&path);
     assert_eq!(count_method(&messages, "session/cancel"), 1);
     assert_eq!(count_method(&messages, "session/close"), 1);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn auto_approve_permissions_answers_without_explicit_handler() {
+    let (mut config, path) = test_config("permission");
+    config.auto_approve_permissions = true;
+    let mut pool = pool(config);
+    let response = ask_once(&pool, AcpPrompt::text("use tool")).unwrap();
+    assert_eq!(response.text, "mock:use tool");
+    pool.shutdown(ShutdownMode::Drain);
+    let messages = log(&path);
+    let reply = messages
+        .iter()
+        .find(|message| message["id"] == 900)
+        .unwrap();
+    assert_eq!(reply["result"]["outcome"]["optionId"], "allow-once");
     let _ = fs::remove_file(path);
 }
 

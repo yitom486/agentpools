@@ -1,6 +1,6 @@
 [package]
 name = "agentpools"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Bounded agent session pools with exclusive worker leases"
 readme = "README.md"

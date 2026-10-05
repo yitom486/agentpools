@@ -187,7 +187,7 @@ impl SharedManager {
             events,
             supports_close,
             ephemeral: config.ephemeral,
-            handler: config.host_handler.clone(),
+            handler: crate::permission_handler(config),
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
             selected_model: selected_model(&created).map(str::to_string),

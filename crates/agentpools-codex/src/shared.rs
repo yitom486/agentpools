@@ -290,7 +290,11 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                 self.close_timeout.min(Duration::from_secs(1)),
                 "thread/delete",
             );
-            if let Err(e) = delete_res {
+            // Ephemeral threads are never persisted server-side, so there is
+            // nothing to delete; any other delete failure still counts.
+            if let Err(e) = delete_res
+                && !e.to_string().contains("not persisted")
+            {
                 result = Err(e);
             }
         }

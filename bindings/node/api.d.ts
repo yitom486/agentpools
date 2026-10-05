@@ -14,6 +14,8 @@ export interface AcpAgentOptions {
   model?: string | null
   timeouts?: AcpTimeouts
   inheritStderr?: boolean
+  /** Answer permission requests without a user (opt-in). Default false (deny). */
+  autoApprovePermissions?: boolean
   ephemeral?: boolean
 }
 

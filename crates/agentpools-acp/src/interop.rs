@@ -46,6 +46,8 @@ pub struct AcpAgentOptions {
     pub timeouts: AcpTimeoutOptions,
     #[serde(default)]
     pub inherit_stderr: bool,
+    #[serde(default)]
+    pub auto_approve_permissions: bool,
     #[serde(default = "default_true")]
     pub ephemeral: bool,
 }
@@ -169,6 +171,7 @@ impl AcpAgentOptions {
         config.prompt_timeout = Duration::from_millis(self.timeouts.prompt_ms);
         config.close_timeout = Duration::from_millis(self.timeouts.close_ms);
         config.inherit_stderr = self.inherit_stderr;
+        config.auto_approve_permissions = self.auto_approve_permissions;
         config.ephemeral = self.ephemeral;
         Ok(config)
     }
@@ -254,6 +257,7 @@ mod tests {
                 model: Some("gpt-6-luna".into()),
                 timeouts: AcpTimeoutOptions::default(),
                 inherit_stderr: false,
+                auto_approve_permissions: false,
                 ephemeral: true,
             }],
             max_queued: 12,

@@ -33,6 +33,50 @@ pub trait HostRequestHandler: Send + Sync {
     fn handle(&self, method: &str, params: &Value) -> Result<Value, AcpError>;
 }
 
+/// Built-in permission handler for unattended hosts: approves
+/// `session/request_permission` by selecting the agent's one-shot allow
+/// option, so injected MCP tools run without a user in the loop.
+/// Anything else (or no allow option at all) is denied exactly like the
+/// previous no-handler default. Only installed via explicit opt-in
+/// (`AcpConfig::auto_approve_permissions`); an explicit `host_handler`
+/// always wins.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutoApprovePermissions;
+
+impl HostRequestHandler for AutoApprovePermissions {
+    fn handle(&self, method: &str, params: &Value) -> Result<Value, AcpError> {
+        if method != "session/request_permission" {
+            return Err(AcpError::Protocol(format!(
+                "client does not implement {method}"
+            )));
+        }
+        let options = params
+            .get("options")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AcpError::Protocol("permission request has no options".into()))?;
+        let pick = options
+            .iter()
+            .find(|option| option.get("kind").and_then(Value::as_str) == Some("allow_once"))
+            .or_else(|| {
+                options.iter().find(|option| {
+                    option
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.starts_with("allow"))
+                })
+            })
+            .and_then(|option| option.get("optionId").and_then(Value::as_str));
+        match pick {
+            Some(option_id) => {
+                Ok(json!({ "outcome": { "outcome": "selected", "optionId": option_id } }))
+            }
+            None => Err(AcpError::Protocol(
+                "permission request has no allow option".into(),
+            )),
+        }
+    }
+}
+
 /// Launch and session options for a single ACP worker.
 pub struct AcpConfig {
     pub program: PathBuf,
@@ -51,6 +95,10 @@ pub struct AcpConfig {
     /// `host_handler`. Defaults to `{}`, which exposes no host tools.
     pub client_capabilities: Value,
     pub host_handler: Option<Arc<dyn HostRequestHandler>>,
+    /// Opt-in unattended permission answers: when set and no explicit
+    /// `host_handler` is installed, `session/request_permission` is answered
+    /// by [`AutoApprovePermissions`]. Default `false` (deny, as before).
+    pub auto_approve_permissions: bool,
     pub handshake_timeout: Duration,
     pub prompt_timeout: Duration,
     pub close_timeout: Duration,
@@ -70,6 +118,7 @@ impl AcpConfig {
             model: None,
             client_capabilities: json!({}),
             host_handler: None,
+            auto_approve_permissions: false,
             handshake_timeout: Duration::from_secs(30),
             prompt_timeout: Duration::from_secs(300),
             close_timeout: Duration::from_secs(3),
@@ -82,6 +131,21 @@ impl AcpConfig {
         self.ephemeral = ephemeral;
         self
     }
+
+    /// Answer permission requests without a user via [`AutoApprovePermissions`].
+    pub fn with_auto_approve_permissions(mut self, auto: bool) -> Self {
+        self.auto_approve_permissions = auto;
+        self
+    }
+}
+
+/// Explicit handler wins; otherwise the opt-in auto approver fills the gap.
+pub(crate) fn permission_handler(config: &AcpConfig) -> Option<Arc<dyn HostRequestHandler>> {
+    config.host_handler.clone().or_else(|| {
+        config
+            .auto_approve_permissions
+            .then(|| Arc::new(AutoApprovePermissions) as Arc<dyn HostRequestHandler>)
+    })
 }
 
 #[derive(Debug)]
@@ -200,7 +264,7 @@ impl AcpSession {
             session_id: String::new(),
             supports_close: false,
             ephemeral: config.ephemeral,
-            handler: config.host_handler.clone(),
+            handler: crate::permission_handler(config),
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
             next_id: 1,
