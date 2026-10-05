@@ -33,6 +33,22 @@ pub struct McpServer {
     pub name: String,
     #[serde(flatten)]
     pub transport: McpTransport,
+    /// Tool approval policy, Codex config-file shape
+    /// (`default_tools_approval_mode` + per-tool `tools.<name>.approval_mode`).
+    /// Only forwarded to Codex app-server entries; ACP values are unaffected.
+    #[serde(default)]
+    pub approval: McpToolApprovals,
+}
+
+/// Per-server tool approval overrides, mirroring the official Codex MCP
+/// configuration (`default_tools_approval_mode`, `tools.<tool>.approval_mode`).
+/// Supported modes include `auto`, `prompt`, `writes`, `approve`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolApprovals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, String>,
 }
 
 impl McpServer {
@@ -45,6 +61,7 @@ impl McpServer {
                 args: Vec::new(),
                 env: BTreeMap::new(),
             },
+            approval: McpToolApprovals::default(),
         }
     }
 
@@ -56,7 +73,25 @@ impl McpServer {
                 url: url.into(),
                 headers: BTreeMap::new(),
             },
+            approval: McpToolApprovals::default(),
         }
+    }
+
+    /// Default approval behavior for this server's tools
+    /// (`auto` | `prompt` | `writes` | `approve`). Forwarded to Codex only.
+    pub fn with_default_tools_approval_mode(mut self, mode: impl Into<String>) -> Self {
+        self.approval.default_tools_approval_mode = Some(mode.into());
+        self
+    }
+
+    /// Per-tool approval behavior override (`tools.<tool>.approval_mode`).
+    pub fn with_tool_approval_mode(
+        mut self,
+        tool: impl Into<String>,
+        mode: impl Into<String>,
+    ) -> Self {
+        self.approval.tools.insert(tool.into(), mode.into());
+        self
     }
 
     /// Add a command-line argument for a stdio server.
@@ -157,10 +192,11 @@ impl McpServer {
 
     /// Converts this MCP server definition into a key-value entry for Codex app-server's `thread/start.params.config.mcp_servers`.
     ///
-    /// The key is the sanitized server name (with whitespace replaced by `_`), and the value contains the server configuration.
+    /// The key is the sanitized server name (with whitespace replaced by `_`), and the value contains the server configuration,
+    /// including tool approval policy when configured.
     pub fn to_codex_entry(&self) -> (String, Value) {
         let sanitized_name = self.name.replace(char::is_whitespace, "_");
-        let value = match &self.transport {
+        let mut value = match &self.transport {
             McpTransport::Stdio { command, args, env } => {
                 json!({
                     "command": command,
@@ -175,6 +211,16 @@ impl McpServer {
                 })
             }
         };
+        if let Some(mode) = &self.approval.default_tools_approval_mode {
+            value["default_tools_approval_mode"] = json!(mode);
+        }
+        if !self.approval.tools.is_empty() {
+            let mut tools = serde_json::Map::new();
+            for (tool, mode) in &self.approval.tools {
+                tools.insert(tool.clone(), json!({ "approval_mode": mode }));
+            }
+            value["tools"] = Value::Object(tools);
+        }
         (sanitized_name, value)
     }
 }
@@ -217,6 +263,24 @@ fn parse_key_value_map(
     Ok(map)
 }
 
+fn parse_tool_approvals(obj: &serde_json::Map<String, Value>) -> McpToolApprovals {
+    let mut approval = McpToolApprovals::default();
+    if let Some(mode) = obj
+        .get("default_tools_approval_mode")
+        .and_then(Value::as_str)
+    {
+        approval.default_tools_approval_mode = Some(mode.to_owned());
+    }
+    if let Some(tools) = obj.get("tools").and_then(Value::as_object) {
+        for (tool, spec) in tools {
+            if let Some(mode) = spec.get("approval_mode").and_then(Value::as_str) {
+                approval.tools.insert(tool.clone(), mode.to_owned());
+            }
+        }
+    }
+    approval
+}
+
 fn parse_single_mcp_server(
     name: &str,
     obj: &serde_json::Map<String, Value>,
@@ -243,6 +307,7 @@ fn parse_single_mcp_server(
                 url: url.to_owned(),
                 headers,
             },
+            approval: parse_tool_approvals(obj),
         })
     } else {
         let Some(command) = command else {
@@ -272,6 +337,7 @@ fn parse_single_mcp_server(
                 args,
                 env,
             },
+            approval: parse_tool_approvals(obj),
         })
     }
 }
@@ -314,6 +380,35 @@ pub fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServer>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_approval_config_parses_and_reaches_codex_entry() {
+        let json = json!([
+            {
+                "name": "textbook",
+                "type": "http",
+                "url": "http://127.0.0.1:9/mcp",
+                "default_tools_approval_mode": "approve",
+                "tools": {
+                    "write_grammar": { "approval_mode": "approve" }
+                }
+            }
+        ]);
+        let servers = parse_mcp_servers(&json).unwrap();
+        assert_eq!(servers.len(), 1);
+        let (name, entry) = servers[0].to_codex_entry();
+        assert_eq!(name, "textbook");
+        assert_eq!(entry["default_tools_approval_mode"], json!("approve"));
+        assert_eq!(
+            entry["tools"]["write_grammar"]["approval_mode"],
+            json!("approve")
+        );
+        // No approval configured: keys stay out of the entry.
+        let plain = McpServer::http("plain", "http://127.0.0.1:9/mcp");
+        let (_, plain_entry) = plain.to_codex_entry();
+        assert!(plain_entry.get("default_tools_approval_mode").is_none());
+        assert!(plain_entry.get("tools").is_none());
+    }
 
     #[test]
     fn parses_array_of_stdio_and_http_servers() {

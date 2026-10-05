@@ -86,11 +86,21 @@ export interface CodexAppServerAgentOptions {
   /** Reasoning effort forwarded to every Codex turn/start. Absent means server default. */
   effort?: string | null
   /** MCP servers injected via thread/start config.mcp_servers (stdio or http entries). */
-  mcpServers?: unknown[]
+  mcpServers?: Array<{
+    name: string
+    type?: string
+    url?: string
+    command?: string
+    args?: string[]
+    env?: Record<string, string> | Array<{ name: string; value: string }>
+    headers?: Record<string, string> | Array<{ name: string; value: string }>
+    /** Default tool approval behavior for this server (official values: auto | prompt | writes | approve). */
+    default_tools_approval_mode?: string
+    /** Per-tool approval overrides: tools.<name>.approval_mode. */
+    tools?: Record<string, { approval_mode?: string }>
+  }>
   /** Thread approval policy. Absent means the native `"never"` default (anything needing approval is denied). */
   approvalPolicy?: string | null
-  /** Opt-in auto-approval for MCP tool-call elicitations. Default false; enable only for first-party localhost tool servers. */
-  autoApproveMcpToolCalls?: boolean | null
   /** Sandbox for model-executed shell commands (official SandboxMode). Absent = server default. */
   sandbox?: string | null
   timeouts?: NativeTimeouts

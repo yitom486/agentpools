@@ -44,13 +44,6 @@ pub struct CodexConfig {
     /// the server default; textbook workers need `workspace-write` so the
     /// file reader can write its audit log and rendered pages under cwd.
     pub sandbox: Option<String>,
-    /// Opt-in auto-approval for the app-server's MCP tool-call elicitations
-    /// (`mcpServer/elicitation/request`). Default `false`: unattended hosts
-    /// must explicitly accept that tools run without a user in the loop.
-    /// Intended for first-party localhost tool servers owned by the host app
-    /// (e.g. the textbook content tools); never enable for third-party or
-    /// remote MCP servers.
-    pub auto_approve_mcp_tool_calls: bool,
     /// If `true` (the default), permanently deletes the session from disk on
     /// close via `thread/delete`, preventing session accumulation.
     pub ephemeral: bool,
@@ -71,7 +64,6 @@ impl CodexConfig {
             effort: None,
             mcp_servers: None,
             approval_policy: "never".to_string(),
-            auto_approve_mcp_tool_calls: false,
             sandbox: None,
             ephemeral: true,
             handshake_timeout: Duration::from_secs(30),
@@ -117,11 +109,6 @@ impl CodexConfig {
 
     pub fn with_approval_policy(mut self, policy: impl Into<String>) -> Self {
         self.approval_policy = policy.into();
-        self
-    }
-
-    pub fn with_auto_approve_mcp_tool_calls(mut self, auto: bool) -> Self {
-        self.auto_approve_mcp_tool_calls = auto;
         self
     }
 
@@ -274,7 +261,6 @@ pub struct CodexSession {
     closed: bool,
     effort: Option<String>,
     activity: Option<ActivitySink>,
-    auto_approve_mcp_tool_calls: bool,
     /// `turn/start` request ids whose response wait was cancelled before the
     /// turn id arrived. Their late responses surface as stale events on the
     /// next turn; the turn id extracted then is interrupted immediately.
@@ -347,7 +333,6 @@ impl CodexSession {
             closed: false,
             effort: config.effort.clone(),
             activity: None,
-            auto_approve_mcp_tool_calls: config.auto_approve_mcp_tool_calls,
             abandoned_starts: Vec::new(),
         })
     }
@@ -482,20 +467,6 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
 
             if event.get("id").is_some() && event.get("method").is_some() {
                 let method = event.get("method").and_then(Value::as_str).unwrap_or("?");
-                if method == "mcpServer/elicitation/request"
-                    && self.auto_approve_mcp_tool_calls
-                    && let Some(id) = event.get("id").and_then(Value::as_u64)
-                {
-                    // Unattended host approval for first-party MCP tool calls.
-                    // Only enabled via explicit opt-in config; the elicitation
-                    // form carries no extra input (empty requestedSchema).
-                    let _ = self.process.send(&json!({
-                        "id": id,
-                        "result": {"action": "accept", "content": {}}
-                    }));
-                    record_activity(&self.activity, "activity", Some(turn_id.clone()));
-                    continue;
-                }
                 let params = event
                     .get("params")
                     .map(|value| value.to_string())

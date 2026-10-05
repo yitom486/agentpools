@@ -147,9 +147,6 @@ pub struct NativeConfig {
     /// needs approval). Unattended MCP tool calls require a policy that lets
     /// them run, e.g. `"untrusted"`.
     approval_policy: String,
-    /// Opt-in auto-approval for the app-server's MCP tool-call elicitations.
-    /// Default `false`; hosts must explicitly accept unattended tool runs.
-    auto_approve_mcp_tool_calls: bool,
     /// Sandbox for model-executed shell commands (official SandboxMode).
     /// Absent = server default.
     sandbox: Option<String>,
@@ -181,7 +178,6 @@ impl NativeConfig {
             effort: None,
             mcp_servers: Vec::new(),
             approval_policy: "never".to_owned(),
-            auto_approve_mcp_tool_calls: false,
             sandbox: None,
             ephemeral: true,
             handshake_timeout: Duration::from_millis(default_handshake_ms()),
@@ -265,7 +261,6 @@ impl NativeConfig {
             config = config.with_effort(effort);
         }
         config = config.with_approval_policy(self.approval_policy.clone());
-        config = config.with_auto_approve_mcp_tool_calls(self.auto_approve_mcp_tool_calls);
         if let Some(sandbox) = &self.sandbox {
             config = config.with_sandbox(sandbox);
         }
@@ -554,9 +549,6 @@ struct NativeAgentOptions {
     /// Codex thread approval policy. Absent means the native `"never"` default.
     #[serde(default)]
     approval_policy: Option<String>,
-    /// Opt-in auto-approval for MCP tool-call elicitations. Default `false`.
-    #[serde(default)]
-    auto_approve_mcp_tool_calls: bool,
     /// Sandbox for model-executed shell commands (official SandboxMode).
     /// Absent = server default.
     #[serde(default)]
@@ -643,7 +635,6 @@ impl NativeAgentOptions {
             effort: self.effort,
             mcp_servers,
             approval_policy: self.approval_policy.unwrap_or_else(|| "never".to_owned()),
-            auto_approve_mcp_tool_calls: self.auto_approve_mcp_tool_calls,
             sandbox: self.sandbox,
             ephemeral: self.ephemeral,
             handshake_timeout: Duration::from_millis(self.timeouts.handshake_ms),
