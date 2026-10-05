@@ -61,6 +61,14 @@ class SessionLease {
     return JSON.parse(await call)
   }
 
+  cancel() {
+    this._native.cancel()
+  }
+
+  drainEvents() {
+    return JSON.parse(this._native.drainEvents())
+  }
+
   finish() {
     if (this._finishPromise) return this._finishPromise
     this._finishing = true

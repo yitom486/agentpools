@@ -38,6 +38,14 @@ fn main() {
                         .pointer("/params/input/0/text")
                         .and_then(Value::as_str)
                         .unwrap();
+                    // Cancel test hook: "wait:*" turns complete only after a
+                    // delay, giving the client time to cancel mid-turn.
+                    // The client must return Cancelled promptly via
+                    // turn/interrupt instead of waiting out the delay.
+                    if let Some(rest) = text.strip_prefix("wait:") {
+                        std::thread::sleep(std::time::Duration::from_millis(3000));
+                        let _ = rest;
+                    }
                     let thread_id = message
                         .pointer("/params/threadId")
                         .and_then(Value::as_str)

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentBackend, AgentSession, CancellationToken};
+use agentpools::{AgentBackend, AgentSession, CancellationToken, record_activity, ActivitySink};
 use serde_json::{Value, json};
 
 use crate::{CodexConfig, CodexError, CodexPrompt, CodexResponse};
@@ -133,6 +133,8 @@ impl SharedCodexManager {
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
             closed: false,
+            effort: config.effort.clone(),
+            activity: None,
         })
     }
 }
@@ -149,6 +151,8 @@ pub struct SharedCodexSession {
     prompt_timeout: Duration,
     close_timeout: Duration,
     closed: bool,
+    effort: Option<String>,
+    activity: Option<ActivitySink>,
 }
 
 impl SharedCodexSession {
@@ -174,13 +178,18 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
             return Err(CodexError::Cancelled);
         }
         let text = request.extract_text()?;
+        self.activity = request.activity.clone();
 
+        let mut turn_params = json!({
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}]
+        });
+        if let Some(effort) = &self.effort {
+            turn_params["effort"] = json!(effort);
+        }
         let start_res = self.process.call(
             "turn/start",
-            json!({
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": text}]
-            }),
+            turn_params,
             self.prompt_timeout,
             "turn/start",
         )?;
@@ -189,6 +198,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
             .and_then(Value::as_str)
             .ok_or_else(|| CodexError::Protocol("turn/start returned no turn id".into()))?
             .to_owned();
+        record_activity(&self.activity, "turn_started", Some(turn_id.clone()));
 
         let mut answer = String::new();
         let mut cancel_sent = false;
@@ -205,6 +215,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                     self.close_timeout,
                     "turn/interrupt",
                 );
+                record_activity(&self.activity, "cancelled", Some(turn_id.clone()));
                 cancel_sent = true;
             }
 
@@ -228,6 +239,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                     return Err(CodexError::Protocol("Codex router closed".into()));
                 }
             };
+            record_activity(&self.activity, "activity", Some(turn_id.clone()));
 
             match event.get("method").and_then(Value::as_str) {
                 Some("item/completed") => {
@@ -249,6 +261,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for SharedCodexSession
                         if answer.is_empty() {
                             return Err(CodexError::NoOutput);
                         }
+                        record_activity(&self.activity, "turn_ended", Some(turn_id.clone()));
                         return Ok(CodexResponse {
                             text: answer,
                             stop_reason: "completed".into(),

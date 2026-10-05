@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use agentpools::{AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode};
+use agentpools::{AgentPool, CancellationToken, LeaseHandle, SessionLease, ShutdownMode, activity_sink, drain_activity, ActivitySink};
 use agentpools_runtime::{RuntimeBackend, RuntimePrompt, build_pool};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -92,6 +92,11 @@ pub struct NativeSessionLease {
     cancellation: CancellationToken,
     request: Mutex<Option<RuntimeLeaseHandle>>,
     lease: Arc<Mutex<Option<RuntimeLease>>>,
+    activity: Mutex<Option<ActivitySink>>,
+    /// Token for the currently running ask, if any. `cancel` reaches the
+    /// active request through this token; the lease-acquisition token above
+    /// cannot, because each ask runs under its own token.
+    ask_cancellation: Mutex<Option<CancellationToken>>,
 }
 
 impl NativeSessionLease {
@@ -100,6 +105,8 @@ impl NativeSessionLease {
             cancellation: handle.cancellation_token(),
             request: Mutex::new(Some(handle)),
             lease: Arc::new(Mutex::new(None)),
+            activity: Mutex::new(None),
+            ask_cancellation: Mutex::new(None),
         }
     }
 }
@@ -109,6 +116,11 @@ impl NativeSessionLease {
     #[napi]
     pub fn cancel(&self) {
         self.cancellation.cancel();
+        if let Ok(slot) = self.ask_cancellation.lock() {
+            // Shared handle: cancelling here reaches the ask even though
+            // `compute` owns its own clone on another thread.
+            let _ = slot.as_ref().map(CancellationToken::cancel);
+        }
     }
 
     #[napi]
@@ -127,7 +139,16 @@ impl NativeSessionLease {
 
     #[napi]
     pub fn ask(&self, prompt_json: String) -> Result<AsyncTask<AskLeaseTask>> {
-        let prompt = parse_prompt(&prompt_json)?;
+        let mut prompt = parse_prompt(&prompt_json)?;
+        let sink = activity_sink();
+        prompt.activity = Some(sink.clone());
+        if let Ok(mut slot) = self.activity.lock() {
+            *slot = Some(sink);
+        }
+        let ask_token = CancellationToken::default();
+        if let Ok(mut slot) = self.ask_cancellation.lock() {
+            *slot = Some(ask_token.clone());
+        }
         let lease = self
             .lease
             .lock()
@@ -138,7 +159,23 @@ impl NativeSessionLease {
             lease: Some(lease),
             storage: Arc::clone(&self.lease),
             prompt: Some(prompt),
+            cancellation: Some(ask_token),
         }))
+    }
+
+    /// Drain buffered turn-activity markers recorded since the last call.
+    /// Returns a JSON array; empty while the turn is quiet. Never blocks.
+    #[napi]
+    pub fn drain_events(&self) -> Result<String> {
+        let events = self
+            .activity
+            .lock()
+            .map_err(|_| Error::from_reason("activity buffer unavailable"))?
+            .as_ref()
+            .map(drain_activity)
+            .unwrap_or_default();
+        let rendered: Vec<String> = events.iter().map(|event| event.to_json_string()).collect();
+        Ok(format!("[{}]", rendered.join(",")))
     }
 
     #[napi]
@@ -184,6 +221,7 @@ pub struct AskLeaseTask {
     lease: Option<RuntimeLease>,
     storage: Arc<Mutex<Option<RuntimeLease>>>,
     prompt: Option<RuntimePrompt>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl Task for AskLeaseTask {
@@ -199,7 +237,8 @@ impl Task for AskLeaseTask {
             .prompt
             .take()
             .ok_or_else(|| Error::from_reason("prompt was already consumed"))?;
-        let result = lease.ask(prompt);
+        let cancellation = self.cancellation.take().unwrap_or_default();
+        let result = lease.ask_with_cancellation(prompt, cancellation);
         *self
             .storage
             .lock()

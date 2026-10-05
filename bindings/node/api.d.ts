@@ -48,9 +48,19 @@ export interface ShutdownReport {
   panickedWorkers: number
 }
 
+export interface ActivityEvent {
+  kind: 'turn_started' | 'activity' | 'turn_ended' | 'cancelled'
+  turnId: string | null
+  atMs: number
+}
+
 export class SessionLease {
   readonly agentIndex: number
   ask(prompt: string | AgentPrompt): Promise<AgentResponse>
+  /** Cooperative cancel for the active ask; safe when idle. */
+  cancel(): void
+  /** Drain turn-activity markers recorded since the last call; never blocks. */
+  drainEvents(): ActivityEvent[]
   finish(): Promise<void>
 }
 
@@ -73,6 +83,10 @@ export interface CodexAppServerAgentOptions {
   env?: Record<string, string>
   cwd: string
   model?: string | null
+  /** Reasoning effort forwarded to every Codex turn/start. Absent means server default. */
+  effort?: string | null
+  /** MCP servers injected via thread/start config.mcp_servers (stdio or http entries). */
+  mcpServers?: unknown[]
   timeouts?: NativeTimeouts
   inheritStderr?: boolean
   ephemeral?: boolean

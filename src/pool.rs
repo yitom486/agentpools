@@ -342,6 +342,11 @@ fn run_lease<B: AgentBackend>(
                 {
                     Ok(_response) if cancellation.is_cancelled() => Err(TaskError::Cancelled),
                     Ok(response) => Ok(response),
+                    // Cooperative cancellation keeps the session: tearing it
+                    // down here would issue a follow-up protocol round-trip
+                    // against a still-busy server, reintroducing the full
+                    // turn latency and breaking lease reuse.
+                    Err(_) if cancellation.is_cancelled() => Err(TaskError::Cancelled),
                     Err(source) => {
                         let close = if !cancellation.is_cancelled()
                             && session

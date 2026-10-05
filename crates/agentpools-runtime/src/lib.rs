@@ -11,7 +11,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentBackend, AgentPool, AgentSession, CancellationToken};
+use agentpools::{ActivitySink, AgentBackend, AgentPool, AgentSession, CancellationToken};
 use agentpools_acp::{
     AcpAgentOptions, AcpBackend, AcpConfig, AcpError, AcpPoolOptions, AcpPrompt, AcpResponse,
     AcpSession,
@@ -30,12 +30,17 @@ use process::JsonProcess;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimePrompt {
     pub content: Vec<Value>,
+    /// Cooperative activity sink for this ask. Never part of prompt JSON:
+    /// skipped by serde, attached by the language binding per call.
+    #[serde(skip)]
+    pub activity: Option<ActivitySink>,
 }
 
 impl RuntimePrompt {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![json!({"type":"text","text":text.into()})],
+            activity: None,
         }
     }
 }
@@ -136,6 +141,7 @@ pub struct NativeConfig {
     env: BTreeMap<String, String>,
     cwd: PathBuf,
     model: Option<String>,
+    effort: Option<String>,
     mcp_servers: Vec<McpServer>,
     ephemeral: bool,
     handshake_timeout: Duration,
@@ -162,6 +168,7 @@ impl NativeConfig {
             env: BTreeMap::new(),
             cwd: cwd.into(),
             model: None,
+            effort: None,
             mcp_servers: Vec::new(),
             ephemeral: true,
             handshake_timeout: Duration::from_millis(default_handshake_ms()),
@@ -241,6 +248,9 @@ impl NativeConfig {
         if let Some(model) = &self.model {
             config = config.with_model(model);
         }
+        if let Some(effort) = &self.effort {
+            config = config.with_effort(effort);
+        }
         if !self.mcp_servers.is_empty() {
             let mut mcp_map = serde_json::Map::new();
             for server in &self.mcp_servers {
@@ -319,6 +329,7 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
                 .run(
                     CodexPrompt {
                         content: request.content,
+                        activity: request.activity,
                     },
                     cancellation,
                 )
@@ -328,6 +339,7 @@ impl AgentSession<RuntimePrompt, RuntimeResponse, RuntimeError> for RuntimeSessi
                 .run(
                     CodexPrompt {
                         content: request.content,
+                        activity: request.activity,
                     },
                     cancellation,
                 )
@@ -517,6 +529,10 @@ struct NativeAgentOptions {
     cwd: PathBuf,
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort forwarded to every Codex `turn/start`
+    /// (mirrors the host Codex adapter per-turn `effort`).
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     mcp_servers: Option<Value>,
     #[serde(default = "default_true")]
@@ -573,6 +589,9 @@ impl NativeAgentOptions {
         if matches!(kind, NativeKind::PiRpc) && self.model.is_some() {
             return Err("set the Pi model through args, for example --model <id>".into());
         }
+        if matches!(kind, NativeKind::PiRpc) && self.effort.is_some() {
+            return Err("Pi RPC runtime does not accept reasoning effort; set the Pi model through args".into());
+        }
         let mcp_servers = if let Some(mcp) = &self.mcp_servers {
             parse_mcp_servers(mcp)?
         } else {
@@ -590,6 +609,7 @@ impl NativeAgentOptions {
             env: self.env,
             cwd: self.cwd,
             model: self.model,
+            effort: self.effort,
             mcp_servers,
             ephemeral: self.ephemeral,
             handshake_timeout: Duration::from_millis(self.timeouts.handshake_ms),

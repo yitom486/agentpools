@@ -1,4 +1,5 @@
 use agentpools::ShutdownMode;
+use agentpools::{CancellationToken, TaskError, activity_sink, drain_activity};
 
 use agentpools_runtime::{RuntimePrompt, build_pool};
 use serde_json::json;
@@ -52,6 +53,7 @@ fn v2_rejects_unknown_runtime_and_non_text_prompts() {
     let mut lease = pool.acquire().unwrap();
     let prompt = RuntimePrompt {
         content: vec![json!({"type":"image","data":"..."})],
+        activity: None,
     };
     assert!(lease.ask(prompt).is_err());
     assert_eq!(
@@ -109,6 +111,70 @@ fn native_workers_handle_cancellation_and_reuse() {
     assert!(res.text.contains("after pi cancel"));
     pi.finish().unwrap();
 
+    assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
+}
+
+#[test]
+fn codex_mid_turn_cancel_returns_promptly_and_reuses_lease() {
+    // The mock sleeps 3s before acking `turn/start` for `wait:*` prompts.
+    // Cancelling mid-turn must return Cancelled promptly (not after the full
+    // delay), record a `cancelled` marker, and keep the lease reusable on the
+    // same session instead of tearing it down and respawning.
+    let program = env!("CARGO_BIN_EXE_mock_runtime");
+    let cwd = std::env::current_dir().unwrap();
+    let options = json!({
+        "apiVersion": 2,
+        "maxQueued": 4,
+        "agents": [
+            {"runtime":"codexAppServer","program":program,"args":["codex"],"cwd":cwd}
+        ]
+    });
+    let mut pool = build_pool(&options.to_string()).unwrap();
+    let mut lease = pool.acquire().unwrap();
+
+    let token = CancellationToken::default();
+    let canceller = token.clone();
+    let (sender, result) = std::sync::mpsc::channel();
+    let mut prompt = RuntimePrompt::text("wait:hello");
+    let sink = activity_sink();
+    prompt.activity = Some(sink.clone());
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome = lease.ask_with_cancellation(prompt, token);
+            let elapsed = started.elapsed();
+            let markers = drain_activity(&sink)
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            let reuse = lease
+                .ask(RuntimePrompt::text("again"))
+                .map(|response| response.text);
+            sender
+                .send((elapsed, outcome, markers, reuse, lease))
+                .unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        canceller.cancel();
+    });
+    let (elapsed, outcome, markers, reuse, lease) = result
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_millis(2500),
+        "cancel did not interrupt the active ask promptly: {elapsed:?}"
+    );
+    assert!(
+        matches!(outcome, Err(TaskError::Cancelled)),
+        "expected TaskError::Cancelled, got {outcome:?}"
+    );
+    assert!(
+        markers.contains(&"cancelled"),
+        "expected a cancelled marker, got {markers:?}"
+    );
+    // Same session kept: the mock turn counter continues instead of restarting.
+    assert_eq!(reuse.unwrap(), "codex:again:2");
+    lease.finish().unwrap();
     assert!(pool.shutdown(ShutdownMode::Drain).close_errors.is_empty());
 }
 

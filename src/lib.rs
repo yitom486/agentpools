@@ -5,11 +5,14 @@
 //! In particular, an ACP adapter can forward caller-provided MCP servers
 //! unchanged when it opens a session; this crate does not parse MCP settings.
 
+mod activity;
 mod backend;
 mod cancellation;
 mod error;
 mod lease;
 mod pool;
+
+pub use activity::{ActivityEvent, ActivitySink, activity_sink, drain_activity, record_activity};
 
 pub use backend::{AgentBackend, AgentSession};
 pub use cancellation::CancellationToken;

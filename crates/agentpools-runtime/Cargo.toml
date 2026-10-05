@@ -1,15 +1,15 @@
 [package]
 name = "agentpools-runtime"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Runtime adapters and versioned binding configuration for agentpools"
 readme = "README.md"
 
 [dependencies]
-agentpools = { version = "0.1.0", path = "../.." }
-agentpools-acp = { version = "0.1.0", path = "../agentpools-acp" }
-agentpools-codex = { version = "0.1.0", path = "../agentpools-codex" }
-agentpools-transport = { version = "0.1.0", path = "../agentpools-transport" }
+agentpools = { version = "0.1.1", path = "../.." }
+agentpools-acp = { version = "0.1.1", path = "../agentpools-acp" }
+agentpools-codex = { version = "0.1.1", path = "../agentpools-codex" }
+agentpools-transport = { version = "0.1.1", path = "../agentpools-transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

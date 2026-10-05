@@ -18,7 +18,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use agentpools::{AgentBackend, AgentSession, CancellationToken};
+use agentpools::{AgentBackend, AgentSession, CancellationToken, record_activity, ActivitySink};
 use agentpools_transport::{JsonProcess, ProcessConfig, TransportError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +31,9 @@ pub struct CodexConfig {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
     pub model: Option<String>,
+    /// Reasoning effort passed to every `turn/start` (mirrors the host Codex
+    /// adapter: per-turn `effort`). Absent means the server default.
+    pub effort: Option<String>,
     /// Opaque JSON object mapping MCP server names to server configurations,
     /// passed to `thread/start.params.config.mcp_servers`.
     pub mcp_servers: Option<Value>,
@@ -53,6 +56,7 @@ impl CodexConfig {
             env: BTreeMap::new(),
             cwd: cwd.into(),
             model: None,
+            effort: None,
             mcp_servers: None,
             approval_policy: "never".to_string(),
             ephemeral: true,
@@ -84,6 +88,11 @@ impl CodexConfig {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
         self
     }
 
@@ -128,12 +137,17 @@ impl CodexConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodexPrompt {
     pub content: Vec<Value>,
+    /// Cooperative activity sink for this ask; hosts drain it to prove liveness.
+    /// Never serialized: set by the runtime binding, not by prompt JSON.
+    #[serde(skip)]
+    pub activity: Option<ActivitySink>,
 }
 
 impl CodexPrompt {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![json!({"type": "text", "text": text.into()})],
+            activity: None,
         }
     }
 
@@ -234,6 +248,12 @@ pub struct CodexSession {
     prompt_timeout: Duration,
     close_timeout: Duration,
     closed: bool,
+    effort: Option<String>,
+    activity: Option<ActivitySink>,
+    /// `turn/start` request ids whose response wait was cancelled before the
+    /// turn id arrived. Their late responses surface as stale events on the
+    /// next turn; the turn id extracted then is interrupted immediately.
+    abandoned_starts: Vec<u64>,
 }
 
 impl CodexSession {
@@ -297,11 +317,37 @@ impl CodexSession {
             prompt_timeout: config.prompt_timeout,
             close_timeout: config.close_timeout,
             closed: false,
+            effort: config.effort.clone(),
+            activity: None,
+            abandoned_starts: Vec::new(),
         })
     }
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    /// If `event` answers an abandoned `turn/start` (a late response to a
+    /// request whose wait was cancelled), consume the request id and return
+    /// the orphaned turn id when the server actually started one (an error
+    /// response means the turn never started, so there is nothing to
+    /// interrupt). Returns `None` for all live traffic.
+    fn harvest_abandoned_start(&mut self, event: &Value) -> Option<Option<String>> {
+        let response_id = event.get("id").and_then(Value::as_u64)?;
+        if event.get("method").is_some() {
+            return None;
+        }
+        let position = self
+            .abandoned_starts
+            .iter()
+            .position(|id| *id == response_id)?;
+        self.abandoned_starts.remove(position);
+        Some(
+            event
+                .pointer("/result/turn/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
     }
 }
 
@@ -315,23 +361,40 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
             return Err(CodexError::Protocol("session already closed".into()));
         }
         let text = request.extract_text()?;
+        self.activity = request.activity.clone();
         let id = self.next_id;
         self.next_id += 1;
+        let mut turn_params = json!({
+            "threadId": self.thread_id,
+            "input": [{"type": "text", "text": text}]
+        });
+        if let Some(effort) = &self.effort {
+            turn_params["effort"] = json!(effort);
+        }
         self.process.send(&json!({
             "id": id,
             "method": "turn/start",
-            "params": {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": text}]
-            }
+            "params": turn_params
         }))?;
         let deadline = Instant::now() + self.prompt_timeout;
-        let result = self.process.response(id, deadline, Some(cancellation))?;
+        let result = match self.process.response(id, deadline, Some(cancellation)) {
+            Ok(result) => result,
+            Err(TransportError::Cancelled) => {
+                // No turn id yet, so no `turn/interrupt` can be addressed.
+                // Remember the request: its late response is harvested on a
+                // later turn and interrupted once the turn id is known.
+                record_activity(&self.activity, "cancelled", None);
+                self.abandoned_starts.push(id);
+                return Err(CodexError::Cancelled);
+            }
+            Err(error) => return Err(CodexError::from(error)),
+        };
         let turn_id = result
             .pointer("/turn/id")
             .and_then(Value::as_str)
             .ok_or_else(|| CodexError::Protocol("turn/start returned no turn id".into()))?
             .to_owned();
+        record_activity(&self.activity, "turn_started", Some(turn_id.clone()));
 
         let mut answer = String::new();
         let mut cancel_sent = false;
@@ -348,6 +411,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
                         "turnId": turn_id
                     }
                 }));
+                record_activity(&self.activity, "cancelled", Some(turn_id.clone()));
                 cancel_sent = true;
             }
 
@@ -364,10 +428,28 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
                             "turnId": turn_id
                         }
                     }));
+                    record_activity(&self.activity, "cancelled", Some(turn_id.clone()));
                     return Err(CodexError::Cancelled);
                 }
                 Err(error) => return Err(CodexError::from(error)),
             };
+            if let Some(orphaned) = self.harvest_abandoned_start(&event) {
+                if let Some(turn_id) = orphaned {
+                    let cancel_id = self.next_id;
+                    self.next_id += 1;
+                    let _ = self.process.send(&json!({
+                        "id": cancel_id,
+                        "method": "turn/interrupt",
+                        "params": {
+                            "threadId": self.thread_id,
+                            "turnId": turn_id
+                        }
+                    }));
+                    record_activity(&self.activity, "cancelled", Some(turn_id));
+                }
+                continue;
+            }
+            record_activity(&self.activity, "activity", Some(turn_id.clone()));
 
             if event.get("id").is_some() && event.get("method").is_some() {
                 return Err(CodexError::Protocol(
@@ -401,6 +483,7 @@ impl AgentSession<CodexPrompt, CodexResponse, CodexError> for CodexSession {
                     if answer.is_empty() {
                         return Err(CodexError::NoOutput);
                     }
+                    record_activity(&self.activity, "turn_ended", Some(turn_id.clone()));
                     return Ok(CodexResponse {
                         text: answer,
                         stop_reason: "completed".into(),
