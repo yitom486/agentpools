@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "agentpools"
-version = "0.1.9"
+version = "0.1.10"
 
 [[package]]
 name = "agentpools-acp"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "agentpools-transport",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentpools-codex"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "agentpools-transport",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "agentpools-runtime"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "agentpools-acp",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agentpools-transport"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "serde",
