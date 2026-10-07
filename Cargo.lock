@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agentpools-node"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "agentpools-runtime",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "agentpools-python"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "agentpools",
  "agentpools-runtime",
