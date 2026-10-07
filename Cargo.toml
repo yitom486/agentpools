@@ -3,6 +3,8 @@ name = "agentpools"
 version = "0.1.9"
 edition = "2024"
 description = "Bounded agent session pools with exclusive worker leases"
+license = "MIT"
+repository = "https://github.com/yitom486/agentpools"
 readme = "README.md"
 
 [workspace]

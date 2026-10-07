@@ -3,6 +3,8 @@ name = "agentpools-codex"
 version = "0.1.9"
 edition = "2024"
 description = "Codex app-server adapter for agentpools with standalone, shared multiplexing, and ephemeral session cleanup"
+license = "MIT"
+repository = "https://github.com/yitom486/agentpools"
 readme = "README.md"
 
 [dependencies]

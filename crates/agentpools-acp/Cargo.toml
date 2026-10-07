@@ -3,6 +3,8 @@ name = "agentpools-acp"
 version = "0.1.9"
 edition = "2024"
 description = "ACP stdio adapter for agentpools"
+license = "MIT"
+repository = "https://github.com/yitom486/agentpools"
 readme = "README.md"
 
 [features]

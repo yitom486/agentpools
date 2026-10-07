@@ -3,6 +3,8 @@ name = "agentpools-transport"
 version = "0.1.9"
 edition = "2024"
 description = "Cross-platform stdio process transport and JSON stream parsing for agentpools"
+license = "MIT"
+repository = "https://github.com/yitom486/agentpools"
 
 [dependencies]
 agentpools = { version = "0.1.9", path = "../.." }
